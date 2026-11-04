@@ -1,0 +1,170 @@
+#!/usr/bin/env node
+/**
+ * Dispatch run-lifecycle hook — reference implementation.
+ *
+ * Copy this file into the TARGET REPO (the one chips launch agents into), e.g.
+ * `dispatch/scripts/run-state.mjs`, and wire it for every agent that repo uses.
+ * The four transitions are the same either way; the config format is not.
+ *
+ *   SessionStart      -> node dispatch/scripts/run-state.mjs running
+ *   UserPromptSubmit  -> node dispatch/scripts/run-state.mjs running
+ *   Stop              -> node dispatch/scripts/run-state.mjs waiting
+ *   SessionEnd        -> node dispatch/scripts/run-state.mjs done
+ *
+ *   Claude Code  ->  .claude/settings.json   (assets/claude-settings-hooks.json)
+ *   Codex        ->  .codex/hooks.json       (assets/codex-hooks.json)
+ *
+ * Codex additionally gates hooks behind a persisted, per-entry **trust**: they
+ * do nothing until you run `codex` interactively once and accept the prompt,
+ * and editing the hooks file un-trusts what you changed. Nothing warns you.
+ *
+ * What it does
+ * ------------
+ * Appends `{id, state, ts}` records to the machine-local runs file the plugin
+ * watches ($DISPATCH_RUNS_FILE), so the board can show a live badge on the card:
+ * launched -> running <-> waiting -> done.
+ *
+ * On "done" it also appends a durable run-log line — naming the agent, plus an
+ * excerpt of its final message — to the launching note under `## Dispatch runs`,
+ * newest first. Live state stays on this machine; only the note travels with
+ * the vault.
+ *
+ * Contract
+ * --------
+ * Dispatch sets these environment variables when a chip launches a tool:
+ *   DISPATCH_RUN_ID     run id to report state for
+ *   DISPATCH_RUNS_FILE  absolute path of the runs .jsonl to append to
+ *   DISPATCH_NOTE       absolute path of the note the chip was launched from
+ *   DISPATCH_LABEL      the chip's label (e.g. "Start development")
+ *   DISPATCH_TOOL       the agent the user chose at click time (e.g. "codex")
+ *   DISPATCH_STARTED    ISO timestamp of the launch
+ * Both agents pass the hook payload as JSON on stdin. Codex hands over the
+ * final message directly (`last_assistant_message`); Claude does not, so it is
+ * reconstructed from `transcript_path`. Either transcript shape is understood.
+ * No dependencies, fully synchronous, and a silent no-op in normal (non-chip)
+ * sessions — this must never disturb a session.
+ *
+ * Zero dependencies. Node 18+.
+ */
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "fs";
+
+const state = process.argv[2];
+const id = process.env.DISPATCH_RUN_ID;
+const runsFile = process.env.DISPATCH_RUNS_FILE;
+
+// Not launched by a chip (or called without a state) — do nothing, quietly.
+if (state && id && runsFile) {
+	reportState(state, id, runsFile);
+	if (state === "done") logRunToNote();
+}
+
+/** Append the state transition the board watches for. */
+function reportState(state, id, runsFile) {
+	try {
+		appendFileSync(runsFile, JSON.stringify({ id, state, ts: new Date().toISOString() }) + "\n");
+	} catch {
+		/* never disturb the session */
+	}
+}
+
+/** Append a run-log entry (+ final-message excerpt) to the launching note. */
+function logRunToNote() {
+	const note = process.env.DISPATCH_NOTE;
+	if (!note || !existsSync(note)) return;
+	try {
+		// Both agents hand the hook their payload as JSON on stdin; absent when
+		// this script is invoked by hand.
+		let hookInput = null;
+		try {
+			hookInput = JSON.parse(readFileSync(0, "utf8") || "null");
+		} catch {
+			/* no stdin */
+		}
+
+		const label = process.env.DISPATCH_LABEL || "run";
+		// Which agent ran. Two agents on one board means a run log that does not
+		// say who ran is not a record (US00002). Absent for a run launched by an
+		// older plugin build, in which case the line reads as it always did.
+		const tool = process.env.DISPATCH_TOOL || "";
+		const started = Date.parse(process.env.DISPATCH_STARTED || "");
+		const minutes = Number.isFinite(started)
+			? Math.max(1, Math.round((Date.now() - started) / 60000))
+			: null;
+
+		const now = new Date();
+		const pad = (n) => String(n).padStart(2, "0");
+		const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+
+		const meta = [tool, "done", minutes ? `${minutes} min` : ""].filter(Boolean).join(", ");
+		let entry = `- ${stamp} — ${label} (${meta})`;
+		// Codex hands the final message over directly; Claude does not, so it is
+		// reconstructed from the transcript. Preferring the field costs nothing
+		// and leaves the working Claude path untouched.
+		const excerpt =
+			flatten(hookInput?.last_assistant_message, 400) ||
+			lastAssistantExcerpt(hookInput?.transcript_path, 400);
+		if (excerpt) entry += `\n    > ${excerpt}`;
+
+		let content = readFileSync(note, "utf8");
+		if (/^## Dispatch runs[ \t]*\r?\n/m.test(content)) {
+			// Newest first, directly under the heading.
+			content = content.replace(/^## Dispatch runs[ \t]*\r?\n/m, (m) => `${m}\n${entry}\n`);
+		} else {
+			content = `${content.replace(/\s*$/, "")}\n\n## Dispatch runs\n\n${entry}\n`;
+		}
+		writeFileSync(note, content);
+	} catch {
+		/* never disturb the session */
+	}
+}
+
+/**
+ * Last agent text from a transcript (JSONL), flattened and truncated. Both
+ * agents write one and neither can read the other's:
+ *
+ * - Claude Code: `{ type: "assistant", message: { content } }`, where content is
+ *   a string or an array of `{ type: "text", text }` blocks.
+ * - Codex: `{ type: "event_msg", payload: { type: "task_complete",
+ *   last_agent_message } }` — note `agent`, not `assistant`.
+ *
+ * Both shapes were read off a real transcript, not assumed. Only reached when
+ * the hook payload did not hand the final message over directly.
+ */
+function lastAssistantExcerpt(transcriptPath, maxLen) {
+	try {
+		if (!transcriptPath || !existsSync(transcriptPath)) return "";
+		let text = "";
+		for (const line of readFileSync(transcriptPath, "utf8").split("\n")) {
+			// Cheap prefilter — one marker per agent.
+			if (!line.includes('"assistant"') && !line.includes('"task_complete"')) continue;
+			try {
+				const entry = JSON.parse(line);
+				if (entry.type === "event_msg" && entry.payload?.type === "task_complete") {
+					const last = entry.payload.last_agent_message;
+					if (typeof last === "string" && last.trim()) text = last;
+					continue;
+				}
+				if (entry.type !== "assistant") continue;
+				const content = entry.message?.content;
+				if (typeof content === "string" && content.trim()) {
+					text = content;
+				} else if (Array.isArray(content)) {
+					const parts = content.filter((c) => c.type === "text" && c.text?.trim());
+					if (parts.length > 0) text = parts.map((c) => c.text).join(" ");
+				}
+			} catch {
+				/* skip malformed line */
+			}
+		}
+		return flatten(text, maxLen);
+	} catch {
+		return "";
+	}
+}
+
+/** One line, trimmed to maxLen. Shared by both agents' final-message sources. */
+function flatten(text, maxLen) {
+	if (typeof text !== "string") return "";
+	const flat = text.replace(/\s+/g, " ").trim();
+	return flat.length > maxLen ? flat.slice(0, maxLen) + "…" : flat;
+}

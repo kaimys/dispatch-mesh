@@ -20,7 +20,7 @@ The current application is a Rust console preview. Tray controls, guided account
 - `scripts/test_github_workflow.py`: optional live GitHub verification using isolated clients.
 - `reports/`: recorded verification results and known limitations.
 
-`dispatch/wiki` contains product concept documents in this working environment. It is ignored by this repository. Do not assume it is disposable or include it in source-repository commits.
+`dispatch/wiki` is the project's Obsidian vault (product concept documents and tickets), synchronized by Mesh itself. It is ignored by this repository. Do not assume it is disposable or include it in source-repository commits.
 
 ## Behavioral invariants
 
@@ -68,3 +68,9 @@ Never delete `.mesh`, reset remote history, overwrite real user files, or remove
 ## Reporting changes
 
 Explain what changed, why, and how it was verified. Distinguish local automated checks from real remote tests and platform coverage. Report failures and remaining limitations honestly, retain useful evidence, and avoid claiming two clients on one Windows machine validate separate hosts or accounts. Use meaningful commit messages describing the resulting behavior.
+
+## Dispatch ticket workflows
+
+Tickets live in the Obsidian vault at `dispatch/wiki` and are worked through the Dispatch board. For any ticket work, read `dispatch/invariants.md` first. The canonical workflows are `dispatch/workflow/*.md`. Codex invokes them as `$refine <id>`, `$develop <id>` and so on through the stubs in `.codex/skills/`, and Claude Code invokes them through `.claude/commands/`.
+
+Codex-specific: `.codex/hooks.json` wires the Dispatch run-lifecycle hooks. Codex runs them only after you accept the hook-trust prompt in an interactive `codex` session. Editing that file un-trusts the changed entries, so re-accept the prompt afterwards.
