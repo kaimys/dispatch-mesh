@@ -82,6 +82,8 @@ The export directory must be new and outside the workspace. Records preserve exa
 
 Mesh persists local state transactionally in `.mesh/state.sqlite` and uses a write-ahead journal when applying incoming content. Do not delete `.mesh`: it holds drafts, pending edits, conflict inputs, and private Git objects. Displaced files remain in `.mesh/recovery/<id>/content` with a `record.json` identifying their original path; no automatic cleanup is performed in this preview. If local edits cannot be separated from received peer text, their bytes are saved in pending-capture state and synchronization pauses for attention. `session finish` checkpoints the current draft and captures those dependent edits into the next session. This conservative fallback avoids attributing another author's work to the local user.
 
+Conflict records retain the exact input revisions that contributed to the competing view. A recorded selection continues to govern those inputs if the clients publish in a different order; later, different edits are reconciled separately. A closed session with no effective changes after integration or resolution is marked discarded instead of adding an empty permanent commit. Its original snapshots, intent, and resolution records remain recoverable. Update collaborating clients together when adopting these workflow fixes.
+
 ## Preview boundaries
 
 - Plain regular files with UTF-8 paths; binary contents are supported. Symlinks, reparse points, submodules, executable file modes, Windows reserved names, and case-colliding paths are unsupported.
@@ -102,3 +104,11 @@ cargo test
 ```
 
 Integration tests use temporary folders and local bare Git remotes. They exercise continuous draft delivery, local author attribution, session boundaries, offline capture, restart recovery, binary preservation and selection, text merging, intent scoping, ignore rules, and path validation. Storage tests cover old-workspace migration, native-file transport, blob reachability after Git garbage collection, recovery-field persistence, and rejection of unshared object references. Provider tests use a local mock HTTP server; no API key or external AI request is needed.
+
+For a live GitHub verification run, use a dedicated test repository:
+
+```powershell
+python scripts/test_github_workflow.py --remote https://github.com/<owner>/<test-repository>.git
+```
+
+The harness writes synthetic data to `main` and Mesh device branches through two isolated Windows clients, retains local evidence, and writes a report under `reports/`. It simulates offline operation by changing only a test client's private Git transport, exercises process termination/restart, and includes a real five-minute inactivity test. It stops only the runner processes it owns. `--resume <evidence-folder>` reuses a run; repeated `--only-case <name>` arguments select targeted reruns. Live AI calls are not part of this harness.

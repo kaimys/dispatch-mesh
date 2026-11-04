@@ -107,6 +107,13 @@ pub struct Conflict<B = Vec<u8>> {
     pub author: Identity,
     pub binary: bool,
     pub created_at: u64,
+    /// Exact per-file revisions contributing to the accepted draft view.
+    #[serde(default)]
+    pub accepted_sessions: BTreeMap<String, String>,
+}
+
+pub fn change_fingerprint(change: &Change) -> String {
+    digest(serde_json::to_vec(&(&change.base, &change.content)).expect("serializable change"))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

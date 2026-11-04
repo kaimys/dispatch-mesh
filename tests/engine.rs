@@ -350,3 +350,140 @@ fn presence_timestamps_belong_to_each_file() {
     assert_eq!(session.changes["one.md"].last_edit, 100);
     assert_eq!(session.changes["two.md"].last_edit, 200);
 }
+
+#[test]
+fn conflict_selection_survives_publishing_the_incoming_session_first() {
+    for choose_incoming in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let origin = temp.path().join("origin.git");
+        remote(&origin);
+        let mut alice = init(&temp.path().join("alice"), "Alice", Some(&origin));
+        fs::write(alice.root.join("image.bin"), [0, 1]).unwrap();
+        finish(&mut alice);
+        let mut bob = init(&temp.path().join("bob"), "Bob", Some(&origin));
+        bob.sync().unwrap();
+        fs::write(alice.root.join("image.bin"), [0, 2]).unwrap();
+        fs::write(bob.root.join("image.bin"), [0, 3]).unwrap();
+        let timestamp = now();
+        alice.capture_at(timestamp).unwrap();
+        bob.capture_at(timestamp + 1).unwrap();
+        alice.sync().unwrap();
+        bob.sync().unwrap();
+        alice.sync().unwrap();
+        let conflict = alice.unresolved().next().unwrap().clone();
+        let selected = if choose_incoming {
+            conflict.incoming.clone()
+        } else {
+            conflict.accepted.clone()
+        }
+        .unwrap();
+        alice.resolve(&conflict.id, choose_incoming).unwrap();
+        alice.sync().unwrap();
+        bob.sync().unwrap();
+        // The client that contributed the incoming version publishes first.
+        // Arrival/publication order must not invalidate an explicit resolution.
+        finish(&mut bob);
+        finish(&mut alice);
+        bob.sync().unwrap();
+        alice.sync().unwrap();
+        assert!(
+            alice.unresolved().next().is_none(),
+            "A resolved conflict reappeared after publication"
+        );
+        assert!(bob.unresolved().next().is_none());
+        assert_eq!(
+            alice.git.files(&alice.state.main).unwrap()["image.bin"],
+            selected
+        );
+        assert_eq!(fs::read(alice.root.join("image.bin")).unwrap(), selected);
+        assert_eq!(fs::read(bob.root.join("image.bin")).unwrap(), selected);
+    }
+}
+
+#[test]
+fn resolution_preserves_a_view_composed_from_multiple_draft_authors() {
+    for choose_incoming in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let origin = temp.path().join("origin.git");
+        remote(&origin);
+        let mut alice = init(&temp.path().join("alice"), "Alice", Some(&origin));
+        let base = b"one\ntwo\nthree\nfour\nfive\n";
+        fs::write(alice.root.join("note.md"), base).unwrap();
+        finish(&mut alice);
+        let mut bob = init(&temp.path().join("bob"), "Bob", Some(&origin));
+        let mut charlie = init(&temp.path().join("charlie"), "Charlie", Some(&origin));
+        bob.sync().unwrap();
+        charlie.sync().unwrap();
+        fs::write(
+            alice.root.join("note.md"),
+            b"ALICE\ntwo\nthree\nfour\nfive\n",
+        )
+        .unwrap();
+        fs::write(bob.root.join("note.md"), b"one\ntwo\nthree\nfour\nBOB\n").unwrap();
+        fs::write(
+            charlie.root.join("note.md"),
+            b"CHARLIE\ntwo\nthree\nfour\nfive\n",
+        )
+        .unwrap();
+        let timestamp = now();
+        alice.capture_at(timestamp).unwrap();
+        bob.capture_at(timestamp + 1).unwrap();
+        charlie.capture_at(timestamp + 2).unwrap();
+        let alice_id = alice.active_session().unwrap().id.clone();
+        let bob_id = bob.active_session().unwrap().id.clone();
+        alice.sync().unwrap();
+        bob.sync().unwrap();
+        charlie.sync().unwrap();
+        alice.sync().unwrap();
+        let conflict = alice.unresolved().next().unwrap().clone();
+        assert!(conflict.accepted_sessions.contains_key(&alice_id));
+        assert!(conflict.accepted_sessions.contains_key(&bob_id));
+        let selected = if choose_incoming {
+            conflict.incoming.clone()
+        } else {
+            conflict.accepted.clone()
+        }
+        .unwrap();
+        alice.resolve(&conflict.id, choose_incoming).unwrap();
+        alice.sync().unwrap();
+        bob.sync().unwrap();
+        charlie.sync().unwrap();
+        finish(&mut charlie);
+        finish(&mut bob);
+        finish(&mut alice);
+        bob.sync().unwrap();
+        charlie.sync().unwrap();
+        alice.sync().unwrap();
+        for workspace in [&alice, &bob, &charlie] {
+            assert!(workspace.unresolved().next().is_none());
+            assert_eq!(fs::read(workspace.root.join("note.md")).unwrap(), selected);
+            assert_eq!(
+                workspace.git.files(&workspace.state.main).unwrap()["note.md"],
+                selected
+            );
+        }
+    }
+}
+
+#[test]
+fn identical_concurrent_changes_do_not_add_an_empty_session_commit() {
+    let temp = TempDir::new().unwrap();
+    let origin = temp.path().join("origin.git");
+    remote(&origin);
+    let mut alice = init(&temp.path().join("alice"), "Alice", Some(&origin));
+    fs::write(alice.root.join("note.md"), "original").unwrap();
+    finish(&mut alice);
+    let mut bob = init(&temp.path().join("bob"), "Bob", Some(&origin));
+    bob.sync().unwrap();
+    fs::write(alice.root.join("note.md"), "same edit").unwrap();
+    fs::write(bob.root.join("note.md"), "same edit").unwrap();
+    alice.capture_at(now()).unwrap();
+    bob.capture_at(now()).unwrap();
+    let bob_id = bob.active_session().unwrap().id.clone();
+    finish(&mut alice);
+    let main = alice.state.main.clone();
+    finish(&mut bob);
+    assert_eq!(bob.state.main, main);
+    assert!(bob.state.manifest.sessions[&bob_id].discarded);
+    assert!(!bob.state.manifest.sessions[&bob_id].changes.is_empty());
+}

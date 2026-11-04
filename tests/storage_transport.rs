@@ -48,6 +48,7 @@ fn fixture(workspace: &mut Workspace) -> Manifest {
         session: session.id.clone(),
         author: workspace.config.identity.clone(),
         binary: true,
+        accepted_sessions: BTreeMap::new(),
         created_at: now(),
     };
     let resolution = Resolution {

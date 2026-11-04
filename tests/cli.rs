@@ -165,6 +165,62 @@ fn running_process_captures_saved_edits_and_restart_recovers_them() {
 }
 
 #[test]
+fn runner_startup_survives_a_concurrent_workspace_operation() {
+    use dispatch_mesh::model::Identity;
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(
+        temp.path(),
+        Identity {
+            name: "Alice".into(),
+            email: "alice@example.test".into(),
+        },
+        None,
+        "main".into(),
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dispatch-mesh"));
+    command
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("run")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let mut runner = Runner(command.spawn().unwrap());
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        runner.0.try_wait().unwrap().is_none(),
+        "Runner exited because another operation briefly held the workspace lock"
+    );
+    fs::write(
+        temp.path().join("after-startup.md"),
+        "captured after contention",
+    )
+    .unwrap();
+    drop(workspace);
+    let started = Instant::now();
+    loop {
+        let state = Workspace::inspect(temp.path()).unwrap().state;
+        if state
+            .observed
+            .get("after-startup.md")
+            .is_some_and(|bytes| bytes == b"captured after contention")
+        {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "Runner did not retry capture after startup contention"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
 fn status_remains_readable_while_an_operation_holds_the_workspace_lock() {
     use dispatch_mesh::model::Identity;
     let temp = tempfile::tempdir().unwrap();

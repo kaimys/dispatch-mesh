@@ -313,7 +313,9 @@ fn report_failure(
 }
 
 async fn watch(root: PathBuf) -> Result<()> {
-    let workspace = Workspace::open(&root)?;
+    // Startup only needs committed configuration. A simultaneous intent/finish
+    // command may hold the operation lock; the capture loop retries that lock.
+    let workspace = Workspace::inspect(&root)?;
     let root = workspace.root.clone();
     let branch = workspace.config.branch.clone();
     drop(workspace);

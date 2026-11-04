@@ -65,6 +65,7 @@ impl<A> Conflict<A> {
             author: self.author,
             binary: self.binary,
             created_at: self.created_at,
+            accepted_sessions: self.accepted_sessions,
         })
     }
 }

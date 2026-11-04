@@ -768,6 +768,7 @@ impl Workspace {
         sessions.sort_by_key(|s| (s.created_at, s.id.clone()));
         let mut pending = sessions;
         let mut applied = BTreeSet::new();
+        let mut sources = BTreeMap::<String, BTreeMap<String, String>>::new();
         while !pending.is_empty() {
             let index = pending
                 .iter()
@@ -786,7 +787,20 @@ impl Workspace {
             let session = pending.remove(index);
             for (path, change) in &session.changes {
                 let accepted = files.get(path).cloned();
-                let resolved = self.merge_change(path, &accepted, change, &session)?;
+                let discarded = self
+                    .matching_resolution(path, change, &session)
+                    .is_some_and(|(_, _, keep)| !keep);
+                let resolved =
+                    self.merge_change(path, &accepted, change, &session, sources.get(path))?;
+                if !discarded
+                    && change.base != change.content
+                    && (resolved != accepted || resolved == change.content)
+                {
+                    sources
+                        .entry(path.clone())
+                        .or_default()
+                        .insert(session.id.clone(), change_fingerprint(change));
+                }
                 set_file(&mut files, path, resolved);
             }
             applied.insert(session.id);
@@ -800,10 +814,8 @@ impl Workspace {
         accepted: &Option<Vec<u8>>,
         change: &Change,
         session: &Session,
+        sources: Option<&BTreeMap<String, String>>,
     ) -> Result<Option<Vec<u8>>> {
-        if let Some(merged) = self.git.merge(accepted, &change.base, &change.content)? {
-            return Ok(merged);
-        }
         let id = digest(serde_json::to_vec(&(
             path,
             &change.base,
@@ -811,10 +823,53 @@ impl Workspace {
             &change.content,
             &session.id,
         ))?);
+        if let Some(sources) = sources
+            && let Some(record) = self.state.conflicts.get_mut(&id)
+        {
+            record.accepted_sessions.extend(sources.clone());
+        }
+        let choice = self.matching_resolution(path, change, session);
+        if choice.is_some_and(|(_, _, keep)| !keep) {
+            // The user rejected this exact input revision. Applying it cleanly
+            // against an older main tree must not resurrect that rejected input.
+            return Ok(accepted.clone());
+        }
+        if let Some(merged) = self.git.merge(accepted, &change.base, &change.content)? {
+            return Ok(merged);
+        }
+        if let Some((conflict, resolution, true)) = choice
+            && [
+                &conflict.base,
+                &conflict.accepted,
+                &conflict.incoming,
+                &resolution.selected,
+            ]
+            .contains(&accepted)
+        {
+            // A different publication order may put either original input on
+            // main first. The recorded choice still governs those same inputs.
+            return Ok(resolution.selected.clone());
+        }
         if let Some(resolution) = self.state.manifest.resolutions.get(&id) {
             return Ok(resolution.selected.clone());
         }
-        self.state
+        let accepted_sessions = sources.cloned().unwrap_or_else(|| {
+            self.state
+                .manifest
+                .sessions
+                .values()
+                .filter(|candidate| candidate.id != session.id && !candidate.settled())
+                .filter_map(|candidate| {
+                    candidate
+                        .changes
+                        .get(path)
+                        .filter(|change| &change.content == accepted)
+                        .map(|change| (candidate.id.clone(), change_fingerprint(change)))
+                })
+                .collect()
+        });
+        let record = self
+            .state
             .conflicts
             .entry(id.clone())
             .or_insert_with(|| Conflict {
@@ -827,8 +882,30 @@ impl Workspace {
                 author: session.author.clone(),
                 binary: binary(accepted) || binary(&change.content),
                 created_at: now(),
+                accepted_sessions: accepted_sessions.clone(),
             });
+        record.accepted_sessions.extend(accepted_sessions);
         Ok(accepted.clone())
+    }
+
+    fn matching_resolution(
+        &self,
+        path: &str,
+        change: &Change,
+        session: &Session,
+    ) -> Option<(&Conflict, &Resolution, bool)> {
+        let fingerprint = change_fingerprint(change);
+        self.state.conflicts.values().filter(|conflict| conflict.path == path).filter_map(|conflict| {
+            let resolution = self.state.manifest.resolutions.get(&conflict.id)?;
+            let incoming = conflict.session == session.id && conflict.base == change.base && conflict.incoming == change.content;
+            let accepted = conflict.accepted_sessions.get(&session.id).is_some_and(|version| version == &fingerprint)
+                // Compatibility for records made before contributor revisions
+                // were stored: infer only an exact original base/version match.
+                || (conflict.accepted_sessions.is_empty() && session.created_at <= conflict.created_at && conflict.session != session.id && conflict.base == change.base && conflict.accepted == change.content);
+            if incoming { Some((conflict, resolution, resolution.selected == conflict.incoming)) }
+            else if accepted { Some((conflict, resolution, resolution.selected == conflict.accepted)) }
+            else { None }
+        }).max_by(|(left, lr, _), (right, rr, _)| (lr.created_at, left.created_at, &left.id).cmp(&(rr.created_at, right.created_at, &right.id)))
     }
 
     fn install(&mut self, desired: Files) -> Result<()> {
@@ -1053,13 +1130,19 @@ impl Workspace {
             }
             let mut files = self.git.files(&self.state.main)?;
             let conflicts_before = self.state.conflicts.len();
+            let mut effective_changes = false;
             for (path, change) in &session.changes {
                 let accepted = files.get(path).cloned();
-                let merged = self.merge_change(path, &accepted, change, &session)?;
+                let merged = self.merge_change(path, &accepted, change, &session, None)?;
+                effective_changes |= merged != accepted;
                 set_file(&mut files, path, merged);
             }
             if self.state.conflicts.len() != conflicts_before {
                 self.save()?;
+                continue;
+            }
+            if !effective_changes {
+                self.discard_empty_projection(&id)?;
                 continue;
             }
             let message = session.message.as_ref().unwrap();
@@ -1100,6 +1183,21 @@ impl Workspace {
             .filter(|c| !self.state.manifest.resolutions.contains_key(&c.id))
     }
 
+    fn discard_empty_projection(&mut self, id: &str) -> Result<()> {
+        let session = self
+            .state
+            .manifest
+            .sessions
+            .get_mut(id)
+            .context("Session not found")?;
+        session.closed = true;
+        session.discarded = true;
+        // Keep its original changes, intent, and conflict inputs in the native
+        // draft record, without adding an empty permanent history commit.
+        session.message = Some(Message { title: "Discard session with no effective file changes".into(), description: "The session was already integrated or its changes were rejected by a recorded conflict resolution. Original snapshots and recorded intent remain recoverable in the session record.".into() });
+        self.save()
+    }
+
     pub fn summary_input(&mut self, id: &str) -> Result<Option<Session>> {
         let session = self
             .state
@@ -1124,7 +1222,7 @@ impl Workspace {
         let mut prepared = session.clone();
         for (path, change) in &session.changes {
             let base = main.get(path).cloned();
-            let content = self.merge_change(path, &base, change, &session)?;
+            let content = self.merge_change(path, &base, change, &session, None)?;
             let entry = prepared.changes.get_mut(path).unwrap();
             entry.base = base;
             entry.content = content;
@@ -1139,6 +1237,10 @@ impl Workspace {
         prepared
             .changes
             .retain(|_, change| change.base != change.content);
+        if session.closed && prepared.changes.is_empty() {
+            self.discard_empty_projection(id)?;
+            return Ok(None);
+        }
         prepared.message_base = Some(self.state.main.clone());
         Ok(Some(prepared))
     }
