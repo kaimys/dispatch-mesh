@@ -11,9 +11,17 @@ use std::{
 };
 
 fn serve(content: &str) -> (String, mpsc::Receiver<Value>, std::thread::JoinHandle<()>) {
+    let body = json!({"choices": [{"message": {"content": content}}]}).to_string();
+    serve_response(200, &body)
+}
+
+fn serve_response(
+    status: u16,
+    body: &str,
+) -> (String, mpsc::Receiver<Value>, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
-    let body = json!({"choices": [{"message": {"content": content}}]}).to_string();
+    let body = body.to_string();
     let (sender, receiver) = mpsc::channel();
     let thread = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -49,7 +57,7 @@ fn serve(content: &str) -> (String, mpsc::Receiver<Value>, std::thread::JoinHand
         sender
             .send(serde_json::from_slice(&request[header_end..header_end + length]).unwrap())
             .unwrap();
-        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
     });
     (url, receiver, thread)
 }
@@ -71,6 +79,179 @@ fn session() -> Session {
     workspace.active_session().unwrap().clone()
 }
 
+fn intent_session() -> Session {
+    let mut session = session();
+    session.intents.insert(
+        "intent-test".into(),
+        Intent {
+            id: "intent-test".into(),
+            purpose: "Explain setup for new colleagues".into(),
+            paths: ["guide.md".into()].into(),
+            created_at: now(),
+        },
+    );
+    session.changes.get_mut("guide.md").unwrap().intent = Some("intent-test".into());
+    session
+}
+
+#[test]
+fn local_fallback_preserves_only_purposes_associated_with_actual_changes() {
+    let mut session = intent_session();
+    session.changes.insert(
+        "unrelated.md".into(),
+        Change {
+            base: None,
+            content: Some(b"unrelated".to_vec()),
+            intent: None,
+            last_edit: now(),
+        },
+    );
+    session.intents.insert(
+        "unused".into(),
+        Intent {
+            id: "unused".into(),
+            purpose: "Unrelated old purpose".into(),
+            paths: ["unused.md".into()].into(),
+            created_at: now(),
+        },
+    );
+    let message = ai::fallback(&session);
+    assert!(
+        message
+            .description
+            .contains("Recorded user intent (requested purpose)")
+    );
+    assert!(
+        message
+            .description
+            .contains("Files: guide.md\nPurpose: Explain setup for new colleagues")
+    );
+    assert!(!message.description.contains("Files: unrelated.md"));
+    assert!(!message.description.contains("Unrelated old purpose"));
+    let change = session.changes.get_mut("guide.md").unwrap();
+    change.base = change.content.clone();
+    assert!(
+        !ai::fallback(&session)
+            .description
+            .contains("Recorded user intent")
+    );
+}
+
+#[tokio::test]
+async fn metadata_only_mode_uses_factual_local_operations_and_keeps_purpose() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(
+        temp.path(),
+        Identity {
+            name: "Alice".into(),
+            email: "alice@example.test".into(),
+        },
+        None,
+        "main".into(),
+    )
+    .unwrap();
+    let mut config = workspace.config.clone();
+    config.provider = Some(ProviderConfig {
+        base_url: "http://127.0.0.1:1/v1".into(),
+        model: "test".into(),
+        api_key_env: None,
+        json_mode: false,
+        send_text: false,
+    });
+    let message = ai::generate(&config, &intent_session()).await;
+    assert_eq!(message.title, "Add guide.md");
+    assert!(message.description.contains("Text sharing is disabled"));
+    assert!(
+        message
+            .description
+            .contains("Purpose: Explain setup for new colleagues")
+    );
+    assert_eq!(
+        message.description.matches("Recorded user intent").count(),
+        1
+    );
+}
+
+#[test]
+fn factual_messages_distinguish_creation_modification_and_deletion() {
+    let mut session = session();
+    for (before, after, title, label) in [
+        (
+            None,
+            Some(b"New milestones".to_vec()),
+            "Add guide.md",
+            "Added",
+        ),
+        (
+            Some(b"Existing milestones".to_vec()),
+            Some(b"Existing milestones\n0.7 macOS beta".to_vec()),
+            "Update guide.md",
+            "Modified",
+        ),
+        (
+            Some(b"Existing milestones".to_vec()),
+            None,
+            "Delete guide.md",
+            "Deleted",
+        ),
+    ] {
+        let change = session.changes.get_mut("guide.md").unwrap();
+        change.base = before;
+        change.content = after;
+        let message = ai::fallback(&session);
+        assert_eq!(message.title, title);
+        assert!(message.description.contains(&format!("{label}: guide.md")));
+    }
+}
+
+#[tokio::test]
+async fn text_enabled_summaries_receive_the_existing_file_and_its_actual_edits() {
+    let (url, receiver, thread) = serve(
+        r#"{"title":"Add macOS beta milestone","description":"Insert a macOS beta milestone into the existing plan."}"#,
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(
+        temp.path(),
+        Identity {
+            name: "Alice".into(),
+            email: "alice@example.test".into(),
+        },
+        None,
+        "main".into(),
+    )
+    .unwrap();
+    let mut config = workspace.config.clone();
+    config.provider = Some(ProviderConfig {
+        base_url: url,
+        model: "test".into(),
+        api_key_env: None,
+        json_mode: true,
+        send_text: true,
+    });
+    let mut session = intent_session();
+    let change = session.changes.get_mut("guide.md").unwrap();
+    change.base = Some(b"Existing milestones\n".to_vec());
+    change.content = Some(b"Existing milestones\n0.7 macOS beta\n".to_vec());
+    let message = ai::generate(&config, &session).await;
+    assert_eq!(message.title, "Add macOS beta milestone");
+    assert!(
+        message
+            .description
+            .contains("Purpose: Explain setup for new colleagues")
+    );
+    let request = receiver.recv().unwrap();
+    let payload: Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    let change = &payload["changes"][0];
+    assert_eq!(change["operation"], "modified");
+    assert_eq!(change["before_exists"], true);
+    assert_eq!(change["after_exists"], true);
+    assert_eq!(change["content_available"], true);
+    assert_eq!(change["before"], "Existing milestones\n");
+    assert_eq!(change["after"], "Existing milestones\n0.7 macOS beta\n");
+    thread.join().unwrap();
+}
+
 #[tokio::test]
 async fn compatible_provider_returns_validated_message_and_withholds_text_by_default() {
     let (url, receiver, thread) =
@@ -88,6 +269,12 @@ async fn compatible_provider_returns_validated_message_and_withholds_text_by_def
     assert_eq!(message.title, "Update guide");
     let request = receiver.recv().unwrap();
     assert!(!request.to_string().contains("confidential sample text"));
+    let payload: Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["changes"][0]["operation"], "added");
+    assert_eq!(payload["changes"][0]["content_available"], false);
+    assert!(payload["changes"][0].get("before").is_none());
+    assert!(payload["changes"][0].get("after").is_none());
     assert!(request.get("response_format").is_none());
     thread.join().unwrap();
 }
@@ -113,8 +300,13 @@ async fn malformed_summary_falls_back_without_changing_providers() {
         json_mode: true,
         send_text: true,
     });
-    let message = ai::generate(&workspace.config, &session()).await;
-    assert_eq!(message.title, "Update guide.md");
+    let message = ai::generate(&workspace.config, &intent_session()).await;
+    assert_eq!(message.title, "Add guide.md");
+    assert!(
+        message
+            .description
+            .contains("Purpose: Explain setup for new colleagues")
+    );
     assert_eq!(
         receiver.recv().unwrap()["response_format"]["type"],
         "json_object"
@@ -140,4 +332,113 @@ fn provider_configuration_accepts_local_models_but_rejects_embedded_secrets() {
         };
         assert_eq!(ai::validate_config(&config).is_ok(), allowed, "{url}");
     }
+}
+
+#[test]
+fn endpoint_url_accepts_api_bases_and_full_routes_without_duplication() {
+    for base in [
+        "https://api.openai.com/v1",
+        "https://api.openai.com/v1/",
+        "https://api.openai.com/v1/chat/completions",
+        "https://api.openai.com/v1/chat/completions/",
+    ] {
+        let config = ProviderConfig {
+            base_url: base.into(),
+            model: "test".into(),
+            api_key_env: None,
+            json_mode: false,
+            send_text: false,
+        };
+        assert_eq!(
+            ai::chat_completions_url(&config).unwrap().as_str(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_full_endpoint_setting_sends_to_the_route_exactly_once() {
+    let (url, receiver, thread) =
+        serve(r#"{"title":"Update guide","description":"Update guide.md."}"#);
+    let provider = ChatCompletions {
+        config: ProviderConfig {
+            base_url: format!("{url}/chat/completions"),
+            model: "test".into(),
+            api_key_env: None,
+            json_mode: true,
+            send_text: false,
+        },
+    };
+    assert_eq!(
+        provider.summarize(&session()).await.unwrap().title,
+        "Update guide"
+    );
+    assert_eq!(
+        receiver.recv().unwrap()["response_format"]["type"],
+        "json_object"
+    );
+    thread.join().unwrap();
+}
+
+#[tokio::test]
+async fn missing_credentials_name_the_required_variable_without_attempting_a_request() {
+    let name = format!("MESH_MISSING_TEST_{}", uuid::Uuid::new_v4().simple());
+    assert!(std::env::var_os(&name).is_none());
+    let provider = ChatCompletions {
+        config: ProviderConfig {
+            base_url: "http://127.0.0.1:1/v1".into(),
+            model: "test".into(),
+            api_key_env: Some(name.clone()),
+            json_mode: false,
+            send_text: false,
+        },
+    };
+    let error = provider
+        .summarize(&session())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(&name));
+    assert!(error.contains("before starting Mesh"));
+}
+
+#[tokio::test]
+async fn authentication_failures_report_http_status_without_echoing_response_contents() {
+    let secret = "sk-test-sensitive-error-body";
+    let (url, receiver, thread) =
+        serve_response(401, &json!({"error": {"message": secret}}).to_string());
+    let provider = ChatCompletions {
+        config: ProviderConfig {
+            base_url: url,
+            model: "test".into(),
+            api_key_env: None,
+            json_mode: false,
+            send_text: false,
+        },
+    };
+    let error = provider.summarize(&session()).await.unwrap_err();
+    assert!(error.to_string().contains("HTTP 401"));
+    assert!(!format!("{error:#}").contains(secret));
+    let _ = receiver.recv().unwrap();
+    thread.join().unwrap();
+}
+
+#[tokio::test]
+async fn invalid_message_errors_do_not_echo_model_output() {
+    let secret = "sk-test-sensitive-model-output";
+    let (url, receiver, thread) = serve(&serde_json::to_string(secret).unwrap());
+    let provider = ChatCompletions {
+        config: ProviderConfig {
+            base_url: url,
+            model: "test".into(),
+            api_key_env: None,
+            json_mode: false,
+            send_text: false,
+        },
+    };
+    let error = provider.summarize(&session()).await.unwrap_err();
+    assert!(error.to_string().contains("enable --json-mode"));
+    assert!(!format!("{error:#}").contains(secret));
+    let _ = receiver.recv().unwrap();
+    thread.join().unwrap();
 }

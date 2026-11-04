@@ -1,6 +1,7 @@
 use crate::{
     git::{Git, validate_path},
     model::*,
+    storage, transport,
 };
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
@@ -18,7 +19,40 @@ pub struct Workspace {
     pub state: State,
     pub git: Git,
     db: Connection,
-    _lock: File,
+    _lock: Option<File>,
+}
+
+#[derive(Debug)]
+pub struct WorkspaceBusy;
+
+impl std::fmt::Display for WorkspaceBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Another Mesh operation is using this workspace; retry shortly"
+        )
+    }
+}
+
+impl std::error::Error for WorkspaceBusy {}
+
+fn operation_lock(meta: &Path, name: &str) -> Result<File> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(meta.join(name))?;
+    match lock.try_lock_exclusive() {
+        Ok(()) => Ok(lock),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || [Some(33), Some(11)].contains(&error.raw_os_error()) =>
+        {
+            Err(WorkspaceBusy.into())
+        }
+        Err(error) => Err(error).context("Cannot lock workspace storage"),
+    }
 }
 
 fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
@@ -76,14 +110,7 @@ impl Workspace {
             !meta.join("config.json").exists(),
             "This folder is already managed by Mesh"
         );
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(meta.join("lock"))?;
-        lock.try_lock_exclusive()
-            .context("Workspace is busy; try again shortly")?;
+        let lock = operation_lock(&meta, "lock")?;
         let git = Git {
             dir: meta.join("objects.git"),
         };
@@ -126,7 +153,7 @@ impl Workspace {
             },
             git,
             db,
-            _lock: lock,
+            _lock: Some(lock),
         };
         workspace.save()?;
         workspace.save_config()?;
@@ -137,7 +164,7 @@ impl Workspace {
 
     fn database(meta: &Path) -> Result<Connection> {
         let db = Connection::open(meta.join("state.sqlite"))?;
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);")?;
+        storage::initialize(&db)?;
         Ok(db)
     }
 
@@ -148,24 +175,13 @@ impl Workspace {
             !fs::symlink_metadata(&meta)?.file_type().is_symlink(),
             "Mesh storage must not be a symbolic link"
         );
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(meta.join("lock"))?;
-        lock.try_lock_exclusive()
-            .context("Workspace is busy; try again shortly")?;
+        let lock = operation_lock(&meta, "lock")?;
         let config: Config = serde_json::from_slice(
             &fs::read(meta.join("config.json")).context("Run workspace init first")?,
         )?;
         ensure!(config.version == 1, "Unsupported workspace format");
         let db = Self::database(&meta)?;
-        let state = serde_json::from_str(&db.query_row::<String, _, _>(
-            "SELECT value FROM state WHERE id=1",
-            [],
-            |row| row.get(0),
-        )?)?;
+        let state = storage::load(&db)?;
         let git = Git {
             dir: meta.join("objects.git"),
         };
@@ -175,19 +191,77 @@ impl Workspace {
             state,
             git,
             db,
-            _lock: lock,
+            _lock: Some(lock),
         };
         workspace.recover_apply()?;
+        // A no-op save also atomically upgrades a version-one local snapshot.
+        workspace.save()?;
         Ok(workspace)
     }
 
+    /// Read the last committed SQLite snapshot without competing with the writer.
+    pub fn inspect(root: &Path) -> Result<Self> {
+        let root = dunce::canonicalize(root).context("Workspace folder does not exist")?;
+        let meta = root.join(".mesh");
+        let config: Config = serde_json::from_slice(&fs::read(meta.join("config.json"))?)?;
+        ensure!(config.version == 1, "Unsupported workspace format");
+        let db = Connection::open_with_flags(
+            meta.join("state.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let state = storage::load(&db)?;
+        Ok(Self {
+            git: Git {
+                dir: meta.join("objects.git"),
+            },
+            root,
+            config,
+            state,
+            db,
+            _lock: None,
+        })
+    }
+
+    /// The caller must also hold network.lock. File capture can proceed while Git
+    /// waits on the remote. Reload afterward so no concurrently saved state is lost.
+    fn network_call<T>(&mut self, operation: impl FnOnce(&Git) -> Result<T>) -> Result<T> {
+        self.save()?;
+        drop(self._lock.take());
+        let result = operation(&self.git);
+        let started = std::time::Instant::now();
+        let lock = loop {
+            match operation_lock(&self.root.join(".mesh"), "lock") {
+                Ok(lock) => break lock,
+                Err(error)
+                    if error.is::<WorkspaceBusy>()
+                        && started.elapsed() < std::time::Duration::from_secs(5) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(25))
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        self._lock = Some(lock);
+        self.state = storage::load(&self.db)?;
+        self.config = serde_json::from_slice(&fs::read(self.root.join(".mesh/config.json"))?)?;
+        self.recover_apply()?;
+        result
+    }
+
     pub fn save_config(&self) -> Result<()> {
+        ensure!(
+            self._lock.is_some(),
+            "Cannot modify configuration without the workspace lock"
+        );
         write_json(&self.root.join(".mesh/config.json"), &self.config)
     }
 
     pub fn save(&self) -> Result<()> {
-        self.db.execute("INSERT INTO state(id,value) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET value=excluded.value", [serde_json::to_string(&self.state)?])?;
-        Ok(())
+        ensure!(
+            self._lock.is_some(),
+            "Cannot save workspace state without its operation lock"
+        );
+        storage::save(&self.db, &self.state)
     }
 
     pub fn scan(&self) -> Result<Files> {
@@ -504,6 +578,7 @@ impl Workspace {
     }
 
     pub fn sync(&mut self) -> Result<()> {
+        let _network_lock = operation_lock(&self.root.join(".mesh"), "network.lock")?;
         self.capture_at(now())?;
         self.close_idle(now())?;
         if self.config.remote.is_some() {
@@ -521,31 +596,19 @@ impl Workspace {
     }
 
     fn fetch(&mut self) -> Result<()> {
-        self.git.run(
-            &[
-                "fetch",
-                "--prune",
-                "origin",
-                "+refs/heads/mesh/devices/*:refs/remotes/origin/mesh/devices/*",
-            ],
-            None,
-        )?;
-        let branch_ref = format!("refs/heads/{}", self.config.branch);
-        let heads = self
-            .git
-            .text(&["ls-remote", "--heads", "origin", &branch_ref])?;
-        if !heads.is_empty() {
-            self.git.run(
+        self.network_call(|git| {
+            git.run(
                 &[
                     "fetch",
+                    "--prune",
                     "origin",
-                    &format!("+{branch_ref}:refs/remotes/origin/workspace"),
+                    "+refs/heads/*:refs/remotes/origin/*",
                 ],
                 None,
-            )?;
-            let next = self
-                .git
-                .text(&["rev-parse", "refs/remotes/origin/workspace"])?;
+            )
+        })?;
+        let remote_ref = format!("refs/remotes/origin/{}", self.config.branch);
+        if let Ok(next) = self.git.text(&["rev-parse", "--verify", &remote_ref]) {
             if let Some(previous) = &self.state.remote_main {
                 self.git
                     .run(&["merge-base", "--is-ancestor", previous, &next], None)
@@ -569,15 +632,7 @@ impl Workspace {
             if device == self.config.device {
                 continue;
             }
-            let data = self
-                .git
-                .run(&["show", &format!("{reference}:state.json")], None)?;
-            ensure!(
-                data.len() <= 128 * 1024 * 1024,
-                "Remote device manifest exceeds preview limit"
-            );
-            let manifest: Manifest = serde_json::from_slice(&data)?;
-            ensure!(manifest.version == 1, "Unsupported remote manifest");
+            let manifest = transport::decode(&self.git, reference, self.config.max_file_bytes)?;
             for (id, session) in manifest.sessions {
                 ensure!(
                     id == session.id && session.device == device && Uuid::parse_str(&id).is_ok(),
@@ -628,9 +683,9 @@ impl Workspace {
         self.save()
     }
 
-    fn push_manifest(&self) -> Result<()> {
+    fn push_manifest(&mut self) -> Result<()> {
         let manifest = Manifest {
-            version: 1,
+            version: 2,
             sessions: self
                 .state
                 .manifest
@@ -642,28 +697,41 @@ impl Workspace {
             resolutions: self.state.manifest.resolutions.clone(),
             conflicts: self.state.conflicts.clone(),
         };
-        let files = Files::from([("state.json".to_string(), serde_json::to_vec(&manifest)?)]);
+        let entries = transport::encode(&self.git, manifest)?;
         let reference = format!("refs/heads/mesh/devices/{}", self.config.device);
         let previous = self.git.text(&["rev-parse", "--verify", &reference]).ok();
         // Retry a prior failed push even when the manifest has not changed.
         let commit = if previous
             .as_ref()
-            .is_some_and(|p| self.git.files(p).is_ok_and(|old| old == files))
+            .is_some_and(|p| self.git.tree_entries(p).is_ok_and(|old| old == entries))
         {
             previous.clone().unwrap()
         } else {
-            self.git.commit(
-                &files,
+            self.git.commit_objects(
+                &entries,
                 previous.as_deref(),
                 &self.config.identity,
                 "Update recoverable Mesh drafts",
             )?
         };
         self.git.run(&["update-ref", &reference, &commit], None)?;
-        self.git.run(
-            &["push", "origin", &format!("{reference}:{reference}")],
-            None,
-        )?;
+        let remote_ref = format!("refs/remotes/origin/mesh/devices/{}", self.config.device);
+        if self
+            .git
+            .text(&["rev-parse", "--verify", &remote_ref])
+            .ok()
+            .as_ref()
+            == Some(&commit)
+        {
+            return Ok(());
+        }
+        self.network_call(|git| {
+            git.run(
+                &["push", "origin", &format!("{reference}:{reference}")],
+                None,
+            )
+        })?;
+        self.git.run(&["update-ref", &remote_ref, &commit], None)?;
         Ok(())
     }
 
@@ -1008,14 +1076,8 @@ impl Workspace {
             if self.config.remote.is_some() {
                 // Ordinary fast-forward push detects a remote publication race. A retry
                 // fetches main and recomputes the merge; shared history is never amended.
-                self.git.run(
-                    &[
-                        "push",
-                        "origin",
-                        &format!("{commit}:refs/heads/{}", self.config.branch),
-                    ],
-                    None,
-                )?;
+                let refspec = format!("{commit}:refs/heads/{}", self.config.branch);
+                self.network_call(|git| git.run(&["push", "origin", &refspec], None))?;
             }
             self.state.main = commit;
             if self.config.remote.is_some() {

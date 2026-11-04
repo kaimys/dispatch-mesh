@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub type Files = BTreeMap<String, Vec<u8>>;
+pub type Files<B = Vec<u8>> = BTreeMap<String, B>;
 
 pub fn now() -> u64 {
     std::time::SystemTime::now()
@@ -45,9 +45,9 @@ pub struct ProviderConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Change {
-    pub base: Option<Vec<u8>>,
-    pub content: Option<Vec<u8>>,
+pub struct Change<B = Vec<u8>> {
+    pub base: Option<B>,
+    pub content: Option<B>,
     pub intent: Option<String>,
     pub last_edit: u64,
 }
@@ -67,7 +67,7 @@ pub struct Message {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Session {
+pub struct Session<B = Vec<u8>> {
     pub id: String,
     pub device: String,
     pub author: Identity,
@@ -78,7 +78,7 @@ pub struct Session {
     pub published: bool,
     #[serde(default)]
     pub discarded: bool,
-    pub changes: BTreeMap<String, Change>,
+    pub changes: BTreeMap<String, Change<B>>,
     pub dependencies: BTreeSet<String>,
     pub intents: BTreeMap<String, Intent>,
     pub message: Option<Message>,
@@ -97,12 +97,12 @@ impl Session {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Conflict {
+pub struct Conflict<B = Vec<u8>> {
     pub id: String,
     pub path: String,
-    pub base: Option<Vec<u8>>,
-    pub accepted: Option<Vec<u8>>,
-    pub incoming: Option<Vec<u8>>,
+    pub base: Option<B>,
+    pub accepted: Option<B>,
+    pub incoming: Option<B>,
     pub session: String,
     pub author: Identity,
     pub binary: bool,
@@ -110,38 +110,38 @@ pub struct Conflict {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Resolution {
+pub struct Resolution<B = Vec<u8>> {
     pub conflict: String,
-    pub selected: Option<Vec<u8>>,
+    pub selected: Option<B>,
     pub author: Identity,
     pub created_at: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct Manifest {
+pub struct Manifest<B = Vec<u8>> {
     pub version: u32,
-    pub sessions: BTreeMap<String, Session>,
-    pub resolutions: BTreeMap<String, Resolution>,
+    pub sessions: BTreeMap<String, Session<B>>,
+    pub resolutions: BTreeMap<String, Resolution<B>>,
     #[serde(default)]
-    pub conflicts: BTreeMap<String, Conflict>,
+    pub conflicts: BTreeMap<String, Conflict<B>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct State {
+pub struct State<B = Vec<u8>> {
     pub main: String,
     /// Last view installed in the live folder; incoming changes never count as local edits.
-    pub observed: Files,
-    pub manifest: Manifest,
-    pub conflicts: BTreeMap<String, Conflict>,
+    pub observed: Files<B>,
+    pub manifest: Manifest<B>,
+    pub conflicts: BTreeMap<String, Conflict<B>>,
     pub intent: Option<Intent>,
     /// Write-ahead apply journal, persisted before touching the live folder.
-    pub applying: Option<Files>,
+    pub applying: Option<Files<B>>,
     pub attention: Option<String>,
     #[serde(default)]
     pub remote_main: Option<String>,
     /// Saved bytes that cannot yet be attributed safely to an existing draft.
     #[serde(default)]
-    pub pending_capture: Option<Files>,
+    pub pending_capture: Option<Files<B>>,
     #[serde(default)]
     pub apply_backups: BTreeMap<String, String>,
 }

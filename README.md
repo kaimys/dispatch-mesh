@@ -2,7 +2,7 @@
 
 Git-backed file synchronization with editing sessions, recorded agent intent, and recoverable conflicts.
 
-**0.1 console preview.** This is the first engine milestone from the concept's delivery sequence. It is intended for disposable test folders, not yet as the sole copy of important data. The tray application, guided account/repository setup, bundled Git, login startup, and authenticated cloud MCP server are not implemented yet.
+**0.2 console preview.** This is the first engine milestone from the concept's delivery sequence. It is intended for disposable test folders, not yet as the sole copy of important data. The tray application, guided account/repository setup, bundled Git, login startup, and authenticated cloud MCP server are not implemented yet.
 
 ## Build and run
 
@@ -27,6 +27,14 @@ dispatch-mesh --workspace C:/MeshDemo session finish
 
 `run` watches files and reconciles missed events with periodic scans. Draft synchronization is attempted every three seconds after writes settle. Sessions span files and close after five minutes without local edits. `session finish` is optional and queues finalization; keep `run` active or invoke `sync` to summarize and publish. Saved edits made afterward enter another session. Incoming changes never reset the local editing timer. Status is JSON, including per-file recent-save presence and unresolved conflict IDs.
 
+Drafts are uploaded as ordinary Git files on the device branches. GitHub's ordinary file browser on `main` shows finalized sessions, so a newly saved file appears there after the five-minute pause and publication, not after its first draft upload. Other Mesh clients consume the drafts before then. To publish sooner, invoke `session finish` while `run` is active, or follow it with `sync` if Mesh is stopped.
+
+On GitHub, select `mesh/devices/<device-id>` and browse `drafts/<session-id>/files/` to inspect current draft content. A version-two `state.json` index stores session metadata and Git blob references. Original versions live under `drafts/<session-id>/base/`; conflict inputs and selected resolutions have their own files under `conflicts/` and `resolutions/`. Empty files are real empty blobs, while a null reference records deletion. Git deduplicates identical content, and every referenced version is kept reachable through the draft tree for fetch and garbage collection. Neither text nor binary contents are embedded as integer arrays in new metadata.
+
+Local state uses the same reference-based model with content-addressed SQLite BLOBs. Opening an existing workspace atomically migrates its version-one state and keeps the original JSON in a migration backup table. Session IDs, content fingerprints, and existing published commits remain unchanged. Version-one remote snapshots remain readable; new device snapshots use version two. Upgrade all collaborating clients before using version-two snapshots. Existing Git history is retained, including old snapshot commits; Mesh does not rewrite it to remove the earlier representation.
+
+`status` reads a committed SQLite snapshot without taking the operation lock, so it remains available during synchronization. It includes `capture_error`, `local_changes_waiting`, and `recovery_pending` diagnostics. Genuine run-loop errors report their cause and are rate-limited; brief internal lock contention is retried quietly without losing pending scans.
+
 ## Agents and intent
 
 ```powershell
@@ -39,6 +47,8 @@ dispatch-mesh --workspace C:/MeshDemo session finish
 
 Only one intent scope may be active per device. Capture occurs before opening a scope and before closing it. Exact relative paths constrain attribution; changes outside those paths have no recorded intent. If a path contains a mixture of scoped and unscoped edits in a session, its aggregate change loses intent attribution rather than claiming the purpose explains every edit. Filesystem watching cannot identify concurrent writers to the same path: agents should use a dedicated working folder/device context. Do not put secrets or entire conversations in `--purpose`.
 
+Recorded purposes appear in the commit body under `Recorded user intent (requested purpose)`, grouped by their associated files. Mesh adds this section locally for both AI-generated messages and local fallback messages, so it does not depend on an AI provider being available or repeating the purpose. Unrelated, mixed-attribution, and reverted changes do not inherit it. The purpose records what was requested, not proof of what was achieved. The title remains a summary of the changes. `status` reports the configured `commit_message_mode`.
+
 ## Local and hosted AI
 
 Without a provider, Mesh uses factual local commit messages. Configure any compatible Chat Completions server:
@@ -50,7 +60,11 @@ dispatch-mesh --workspace C:/MeshDemo provider test
 
 For a hosted provider, supply an HTTPS base URL and `--api-key-env MESH_AI_KEY`, with the credential already set in that environment variable. Keys are not stored in configuration. Add `--json-mode` only if the endpoint supports JSON-object mode.
 
-By default the request includes filenames, sizes, and snapshot IDs, with text and intent withheld. **Add `--send-text` to explicitly allow transmission of text snapshots and recorded intent to that endpoint.** A snapshot may contain sensitive prose; generic secret detection is not implemented. Exclude private content before enabling it. Binary payloads are never sent for summarization. `provider test` uses synthetic input, not workspace files. `provider off` disables AI.
+Both an API base such as `https://api.openai.com/v1` and a full endpoint such as `https://api.openai.com/v1/chat/completions` are accepted. Mesh resolves the route once. Set the key in the same terminal before starting `run`; environment changes made later are not inherited by an already running process. Use `provider test` from that terminal to verify credentials and response formatting with synthetic input. Provider failures report the missing variable, HTTP status, timeout, or response-format problem without echoing response bodies or credentials.
+
+By default, file contents remain private and Mesh generates factual file-operation messages locally (`local_metadata` mode). These distinguish added, modified, and deleted files without asking a model to infer changes from filenames or sizes. Recorded purpose is still included locally.
+
+**Add `--send-text` to enable AI change summaries and explicitly allow transmission of before/after text snapshots and recorded intent to that endpoint.** Requests include authoritative file-operation and existence fields, so a modification to an existing document is distinguishable from creating a new file. A snapshot may contain sensitive prose; generic secret detection is not implemented. Exclude private content before enabling it. Binary payloads are never sent for summarization. `provider test` always uses synthetic input to check the endpoint, even in metadata-only mode. `provider off` disables AI.
 
 AI requests have timeouts, bounded retries, response validation, and a factual fallback. There is no automatic provider switching. Summaries are tied to frozen session content and the integrated history base; if that base advances, Mesh discards the outdated message and schedules a new one. The run loop can capture while a summary request is pending.
 
@@ -71,11 +85,11 @@ Mesh persists local state transactionally in `.mesh/state.sqlite` and uses a wri
 ## Preview boundaries
 
 - Plain regular files with UTF-8 paths; binary contents are supported. Symlinks, reparse points, submodules, executable file modes, Windows reserved names, and case-colliding paths are unsupported.
-- Default maximum file size: 16 MiB, configurable in `.mesh/config.json`. Device manifests are JSON snapshots and keep settled sessions and conflict inputs; this is deliberately unoptimized and unsuitable for large binary collections. Retention and garbage collection are not yet implemented.
+- Default maximum file size: 16 MiB, configurable in `.mesh/config.json`. Metadata references native Git blobs and deduplicated local SQLite BLOBs. Settled sessions and conflict inputs are retained, and reconstructing a device snapshot is bounded by a 128 MiB preview memory limit. Large-file storage, retention, and application-level cleanup remain future work.
 - `.mesh`, `.git`, `.env`, `.env.*`, `*.pem`, and `*.key` are excluded. `.gitignore` and `.meshignore` are honored. Use matching ignore policies on all clients; changing ignore rules for already synchronized files is not supported yet.
 - Git credentials and commit identity are configured separately. This preview trusts collaborators authorized to write the remote repository; it does not implement cloud principal isolation or workspace permissions.
 - Same-file dependencies can delay permanent publication until upstream sessions finish. Draft ordering uses explicit dependencies and a stable timestamp/ID order for independent sessions; distributed conflict display policy is experimental.
-- Git network operations currently take a workspace operation lock. They are bounded but can temporarily delay capture and CLI actions. Separating the network worker from the capture journal is required before production use.
+- Git network operations run on a separate worker and release the workspace operation lock while waiting on the remote. The worker reloads durable state before continuing, preserving edits captured during the request. One network cycle runs at a time; local merge/apply phases can still briefly hold the operation lock.
 - Connecting an existing Git checkout does not yet import its local history automatically. Use a fresh folder with the remote option for an existing shared repository. Manual Git interoperability is outside the initial supported workflow.
 - No tray/status window, desktop notifications, guided repository creation, bundled Git, installer, login startup, editor presence integration, or authenticated remote MCP yet. CLI status and conflict commands expose the underlying engine operations for this milestone.
 
@@ -87,4 +101,4 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-Integration tests use temporary folders and local bare Git remotes. They exercise continuous draft delivery, local author attribution, session boundaries, offline capture, restart recovery, binary preservation and selection, text merging, intent scoping, ignore rules, and path validation. Provider tests use a local mock HTTP server; no API key or external AI request is needed.
+Integration tests use temporary folders and local bare Git remotes. They exercise continuous draft delivery, local author attribution, session boundaries, offline capture, restart recovery, binary preservation and selection, text merging, intent scoping, ignore rules, and path validation. Storage tests cover old-workspace migration, native-file transport, blob reachability after Git garbage collection, recovery-field persistence, and rejection of unshared object references. Provider tests use a local mock HTTP server; no API key or external AI request is needed.

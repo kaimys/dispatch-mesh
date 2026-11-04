@@ -1,6 +1,10 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use dispatch_mesh::{ai, engine::Workspace, model::*};
+use dispatch_mesh::{
+    ai,
+    engine::{Workspace, WorkspaceBusy},
+    model::*,
+};
 use notify::Watcher;
 use serde_json::json;
 use std::{path::PathBuf, time::Duration};
@@ -138,6 +142,9 @@ async fn execute(cli: Cli) -> Result<()> {
     if matches!(cli.command, Command::Run) {
         return watch(cli.workspace).await;
     }
+    if matches!(cli.command, Command::Status) {
+        return show_status(&Workspace::inspect(&cli.workspace)?);
+    }
     let mut workspace = Workspace::open(&cli.workspace)?;
     match cli.command {
         Command::Sync => {
@@ -159,7 +166,7 @@ async fn execute(cli: Cli) -> Result<()> {
         },
         Command::Conflicts { command } => match command {
             ConflictCommand::List => println!("{}", serde_json::to_string_pretty(&workspace.unresolved().map(|c| json!({"id": c.id, "path": c.path, "binary": c.binary, "incoming_author": c.author})).collect::<Vec<_>>())?),
-            ConflictCommand::Show { id } => println!("{}", serde_json::to_string_pretty(workspace.state.conflicts.get(&id).context("Conflict not found")?)?),
+            ConflictCommand::Show { id } => println!("{}", serde_json::to_string_pretty(&conflict_details(workspace.state.conflicts.get(&id).context("Conflict not found")?))?),
             ConflictCommand::Resolve { id, choose } => { workspace.resolve(&id, choose == "incoming")?; println!("Resolution recorded. Run sync or keep Mesh running to share it."); },
             ConflictCommand::Export { id, output } => {
                 let conflict = workspace.state.conflicts.get(&id).context("Conflict not found")?;
@@ -170,7 +177,7 @@ async fn execute(cli: Cli) -> Result<()> {
                 for (name, content) in [("base", &conflict.base), ("accepted", &conflict.accepted), ("incoming", &conflict.incoming)] {
                     if let Some(bytes) = content { std::fs::write(output.join(name), bytes)?; }
                 }
-                std::fs::write(output.join("conflict.json"), serde_json::to_vec_pretty(conflict)?)?;
+                std::fs::write(output.join("conflict.json"), serde_json::to_vec_pretty(&conflict_details(conflict))?)?;
                 println!("Exported to {}", output.display());
             }
         },
@@ -199,19 +206,39 @@ async fn execute(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+fn conflict_details(conflict: &Conflict) -> serde_json::Value {
+    let version = |name: &str, bytes: &Option<Vec<u8>>| {
+        bytes
+            .as_ref()
+            .map(|bytes| json!({"file": name, "bytes": bytes.len(), "sha256": digest(bytes)}))
+    };
+    json!({"format": 2, "id": conflict.id, "path": conflict.path, "session": conflict.session, "author": conflict.author,
+        "binary": conflict.binary, "created_at": conflict.created_at,
+        "base": version("base", &conflict.base), "accepted": version("accepted", &conflict.accepted), "incoming": version("incoming", &conflict.incoming)})
+}
+
 fn show_status(workspace: &Workspace) -> Result<()> {
+    let scan = workspace.scan();
+    let capture_error = scan.as_ref().err().map(|error| format!("{error:#}"));
+    let local_changes_waiting = scan
+        .as_ref()
+        .is_ok_and(|files| files != &workspace.state.observed);
     let timestamp = now();
     let presence: Vec<_> = workspace.state.manifest.sessions.values().filter(|s| !s.closed && !s.settled()).flat_map(|s| s.changes.iter().map(move |(path, change)| (s, path, change)))
         .filter(|(_, _, change)| timestamp.saturating_sub(change.last_edit) < 300)
         .map(|(s, path, change)| json!({"path": path, "author": s.author, "device": s.device, "last_saved": change.last_edit, "signal": "recent_save"})).collect();
-    let status = if workspace.state.attention.is_some() || workspace.unresolved().next().is_some() {
+    let status = if workspace.state.attention.is_some()
+        || capture_error.is_some()
+        || workspace.unresolved().next().is_some()
+    {
         "needs_attention"
-    } else if workspace
-        .state
-        .manifest
-        .sessions
-        .values()
-        .any(|s| s.device == workspace.config.device && !s.settled())
+    } else if local_changes_waiting
+        || workspace
+            .state
+            .manifest
+            .sessions
+            .values()
+            .any(|s| s.device == workspace.config.device && !s.settled())
     {
         "waiting_to_sync"
     } else {
@@ -221,7 +248,8 @@ fn show_status(workspace: &Workspace) -> Result<()> {
         "{}",
         serde_json::to_string_pretty(
             &json!({"status": status, "device": workspace.config.device, "main": workspace.state.main,
-                    "attention": workspace.state.attention, "active_session": workspace.active_session().map(|s| &s.id),
+                    "commit_message_mode": match &workspace.config.provider { None => "local_fallback", Some(provider) if provider.send_text => "ai_with_text", Some(_) => "local_metadata" },
+                    "attention": workspace.state.attention, "capture_error": capture_error, "local_changes_waiting": local_changes_waiting, "recovery_pending": workspace.state.applying.is_some(), "active_session": workspace.active_session().map(|s| &s.id),
             "sessions": workspace.state.manifest.sessions.values().map(|s| json!({"id": s.id, "author": s.author, "closed": s.closed, "published": s.published, "discarded": s.discarded, "files": s.changes.keys().collect::<Vec<_>>(), "dependencies": s.dependencies})).collect::<Vec<_>>(),
                     "unresolved_conflicts": workspace.unresolved().map(|c| json!({"id": c.id, "path": c.path, "binary": c.binary})).collect::<Vec<_>>(), "presence": presence
                 })
@@ -266,12 +294,29 @@ async fn summarize_ready(root: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+fn report_failure(
+    label: &str,
+    error: &anyhow::Error,
+    previous: &mut Option<(String, std::time::Instant)>,
+) {
+    if error.is::<WorkspaceBusy>() {
+        return;
+    }
+    let message = format!("{error:#}");
+    if previous
+        .as_ref()
+        .is_none_or(|(old, time)| old != &message || time.elapsed() >= Duration::from_secs(60))
+    {
+        eprintln!("{label}: {message}. Prior snapshots are retained.");
+        *previous = Some((message, std::time::Instant::now()));
+    }
+}
+
 async fn watch(root: PathBuf) -> Result<()> {
     let workspace = Workspace::open(&root)?;
     let root = workspace.root.clone();
+    let branch = workspace.config.branch.clone();
     drop(workspace);
-    // One watcher process per workspace, while short operation locks allow the CLI
-    // to register intent and finish sessions while the process is running.
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -286,33 +331,58 @@ async fn watch(root: PathBuf) -> Result<()> {
     })?;
     watcher.watch(&root, notify::RecursiveMode::Recursive)?;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut candidate: Option<Files> = None;
+    let mut pending_scan = true;
     let mut summary: Option<tokio::task::JoinHandle<Result<()>>> = None;
+    let mut synchronization: Option<tokio::task::JoinHandle<Result<()>>> = None;
+    let mut next_sync = std::time::Instant::now();
+    let mut capture_error = None;
+    let mut sync_error = None;
+    let mut summary_error = None;
     let mut cycles = 0_u64;
     println!(
-        "Mesh is running for {}. Ctrl+C saves local work and stops. Sessions close automatically after five minutes.",
+        "Mesh is running for {}. Ctrl+C saves local work and stops. Sessions close automatically after five minutes.\nDrafts synchronize continuously as internal snapshots. Files appear on GitHub's {branch} branch after session finalization; use session finish to finalize sooner.",
         root.display()
     );
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
+                // A short local operation never waits for an HTTP response.
                 let mut workspace = Workspace::open(&root)?;
                 workspace.capture_at(now())?;
                 println!("Local changes saved. Mesh stopped.");
                 return Ok(());
             }
             _ = tick.tick() => {
-                // Events are hints; periodic full scans recover missed notifications.
-                let mut dirty = cycles == 0 || cycles.is_multiple_of(30);
+                if synchronization.as_ref().is_some_and(|job| job.is_finished())
+                    && let Some(job) = synchronization.take() {
+                    match job.await? {
+                        Ok(()) => { if sync_error.take().is_some() { println!("Synchronization resumed."); } },
+                        Err(error) => report_failure("Synchronization waiting", &error, &mut sync_error),
+                    }
+                    next_sync = std::time::Instant::now() + Duration::from_secs(3);
+                }
+                if summary.as_ref().is_some_and(|job| job.is_finished())
+                    && let Some(job) = summary.take() {
+                    match job.await? {
+                        Ok(()) => summary_error = None,
+                        Err(error) => report_failure("Summary deferred", &error, &mut summary_error),
+                    }
+                }
+                pending_scan |= cycles.is_multiple_of(30);
                 for event in receiver.try_iter() {
                     match event {
-                        Ok(event) => dirty |= event.paths.iter().any(|p| !p.starts_with(root.join(".mesh")) && !p.starts_with(root.join(".git"))),
-                        Err(_) => dirty = true,
+                        Ok(event) => pending_scan |= event.paths.iter().any(|p| !p.starts_with(root.join(".mesh")) && !p.starts_with(root.join(".git"))),
+                        Err(_) => pending_scan = true,
                     }
                 }
                 let capture_root = root.clone();
-                let previous = candidate.take();
-                let capture = tokio::task::spawn_blocking(move || -> Result<Option<Files>> {
+                // Retain both the candidate and dirty flag if another operation briefly
+                // owns the lock. Dropping them could postpone capture until the next scan.
+                let previous = candidate.clone();
+                let dirty = pending_scan;
+                let capture = tokio::task::spawn_blocking(move || -> Result<(Option<Files>, bool)> {
                     let mut workspace = Workspace::open(&capture_root)?;
                     let mut next = None;
                     if dirty || previous.is_some() {
@@ -321,30 +391,34 @@ async fn watch(root: PathBuf) -> Result<()> {
                         else if files != workspace.state.observed { next = Some(files); }
                     }
                     workspace.close_idle(now())?;
-                    Ok(next)
+                    let needs_summary = workspace.state.manifest.sessions.values().any(|s| s.device == workspace.config.device && s.closed && !s.settled() && s.message.is_none());
+                    Ok((next, needs_summary))
                 }).await?;
+                let mut needs_summary = false;
                 match capture {
-                    Ok(next) => candidate = next,
-                    Err(_) => eprintln!("Capture waiting: workspace busy or a file is unreadable/changing. Prior snapshots are retained."),
+                    Ok((next, ready)) => {
+                        candidate = next;
+                        pending_scan = false;
+                        needs_summary = ready;
+                        if capture_error.take().is_some() { println!("Local capture resumed."); }
+                    },
+                    Err(error) => { pending_scan = true; report_failure("Capture waiting", &error, &mut capture_error); },
                 }
-                if cycles.is_multiple_of(3) && candidate.is_none() {
+                if synchronization.is_none() && candidate.is_none() && !pending_scan && std::time::Instant::now() >= next_sync {
                     let sync_root = root.clone();
-                    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+                    synchronization = Some(tokio::task::spawn_blocking(move || -> Result<()> {
                         let mut workspace = Workspace::open(&sync_root)?;
-                        if let Err(error) = workspace.sync() {
-                            workspace.state.attention = Some("Synchronization paused or offline; local snapshots retained. Retry sync after checking repository access and conflicts.".into());
+                        let result = workspace.sync();
+                        drop(workspace);
+                        if let Err(error) = &result && !error.is::<WorkspaceBusy>()
+                            && let Ok(mut workspace) = Workspace::open(&sync_root) {
+                            workspace.state.attention = Some(format!("Synchronization waiting: {error:#}"));
                             workspace.save()?;
-                            return Err(error);
                         }
-                        Ok(())
-                    }).await?;
-                    if result.is_err() { eprintln!("Synchronization waiting; local capture continues. See status for details."); }
+                        result
+                    }));
                 }
-                if summary.as_ref().is_some_and(|job| job.is_finished())
-                    && let Some(job) = summary.take() {
-                        match job.await { Ok(Ok(())) => {}, _ => eprintln!("Summary deferred; next cycle will retry.") }
-                }
-                if summary.is_none() {
+                if summary.is_none() && needs_summary {
                     let root = root.clone();
                     summary = Some(tokio::spawn(async move { summarize_ready(&root).await }));
                 }

@@ -114,6 +114,20 @@ impl Git {
         author: &Identity,
         message: &str,
     ) -> Result<String> {
+        let entries = files
+            .iter()
+            .map(|(path, bytes)| Ok((path.clone(), self.object(bytes)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        self.commit_objects(&entries, parent, author, message)
+    }
+
+    pub fn commit_objects(
+        &self,
+        objects: &BTreeMap<String, String>,
+        parent: Option<&str>,
+        author: &Identity,
+        message: &str,
+    ) -> Result<String> {
         let temp = tempfile::tempdir()?;
         let index = temp.path().join("index");
         self.execute(
@@ -124,9 +138,9 @@ impl Git {
         )
         .context("Create isolated index")?;
         let mut entries = Vec::new();
-        for (path, bytes) in files {
+        for (path, blob) in objects {
             validate_path(path)?;
-            let blob = self.object(bytes)?;
+            validate_oid(blob)?;
             entries.extend_from_slice(format!("100644 {blob}\t{path}\0").as_bytes());
         }
         self.execute(
@@ -165,6 +179,23 @@ impl Git {
     }
 
     pub fn files(&self, reference: &str) -> Result<Files> {
+        self.tree_entries(reference)?
+            .into_iter()
+            .map(|(path, blob)| Ok((path, self.read_blob(&blob, 128 * 1024 * 1024)?)))
+            .collect()
+    }
+
+    pub fn read_blob(&self, object: &str, limit: u64) -> Result<Vec<u8>> {
+        validate_oid(object)?;
+        let size: u64 = self.text(&["cat-file", "-s", object])?.parse()?;
+        anyhow::ensure!(
+            size <= limit,
+            "Referenced Git blob exceeds the configured size limit"
+        );
+        self.run(&["cat-file", "blob", object], None)
+    }
+
+    pub fn tree_entries(&self, reference: &str) -> Result<BTreeMap<String, String>> {
         let mut files = BTreeMap::new();
         for record in self
             .run(&["ls-tree", "-r", "-z", reference], None)?
@@ -179,10 +210,8 @@ impl Git {
                 fields.len() == 3 && fields[0] == "100644" && fields[1] == "blob",
                 "Unsupported executable, symlink, or submodule at {path}; connect a plain-file workspace for this preview"
             );
-            files.insert(
-                path.to_string(),
-                self.run(&["cat-file", "blob", fields[2]], None)?,
-            );
+            validate_oid(fields[2])?;
+            files.insert(path.to_string(), fields[2].to_string());
         }
         Ok(files)
     }
@@ -224,6 +253,17 @@ impl Git {
             Err(_) => Ok(None),
         }
     }
+}
+
+pub fn validate_oid(object: &str) -> Result<()> {
+    anyhow::ensure!(
+        [40, 64].contains(&object.len())
+            && object
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "Invalid Git object reference"
+    );
+    Ok(())
 }
 
 pub fn validate_path(path: &str) -> Result<()> {
