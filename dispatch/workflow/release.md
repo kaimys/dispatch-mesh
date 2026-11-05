@@ -32,9 +32,24 @@ Releases one version. `<ARGS>` is the target version (e.g. `v1.4.0`); without it
 6. Bump the version in the project's manifest(s), consistently — one source of truth, everything else derived.
 7. **Write the release note** `dispatch/wiki/08_Delivery-and-QA/Releases/<version>.md` from `dispatch/wiki/00_Start-Here/Templates/release-note.md`: `version:` and `date:` frontmatter exactly as the template shows — **the Release Plan tab parses these**, and a malformed one silently drops the release from the board. Contents: what shipped as **links to the tickets** (they carry the detail — don't restate it), build metadata, and what deliberately did not make it.
 8. Build, tag and publish per the project's process.
+9. **Write the GitHub release text** `dispatch/wiki/08_Delivery-and-QA/Releases/GitHub/<version> GitHub release.md`: a paste-ready body for the GitHub release of the tag, written for users rather than for the board.
+   - **Frontmatter:** only `owner:` and `release: "[[<version>]]"`. Never add `version:` or `date:`: the Release Plan would count the page as a second release.
+   - **Body:**
+     - one-line summary;
+     - *What's new*, grouped by ticket;
+     - *Breaking changes*, when there are any;
+     - *Upgrading*: migration and compatibility;
+     - *Not in this release*;
+     - *Download*: package contents and SHA-256 of each artifact;
+     - the build line: tag, commit, toolchain, CI.
+
+     Behavior is described in user terms. Unlike the release note, this text summarizes, because GitHub readers cannot follow wikilinks.
+   - **Links are absolute URLs into the public wiki repository**, `https://github.com/kaimys/dispatch-mesh-llm-wiki/blob/main/<vault path>`. The vault path is the page's path relative to `dispatch/wiki`, URL-encoded: spaces become `%20`, and the em dash in ADR titles becomes `%E2%80%94`. Link the shipped and deferred tickets, the governing ADRs and the milestone section. Never use wikilinks.
+   - **Verify every link before handing the text over:** the file must exist in that repository. Use the directory listing's `html_url` from `gh api repos/kaimys/dispatch-mesh-llm-wiki/contents/<dir>`. A page the vault has not yet synchronized there (typically this release's own note) is left out and named in the report, not linked to a 404.
+   - Producing the text publishes nothing. Creating the GitHub release object or uploading assets is publication under the release policy: ask first.
 
 ## Land it
 
-9. **Promote the shipped tickets:** write status → `Released`, then mirror the tracker. Do **not** stamp `completed` here and never overwrite one already there — completion belongs to `Done`, which the team reaches on its own (including via `/fix-bug`), and a date invented at release time dates the forecast from the release rather than from the work. Board automations fire on a drag, never on frontmatter an agent writes, so whatever the `Released` drag would have mirrored is this step's job to do by hand. A tracker failure is a reported partial synchronization failure; retain the record and retry that operation on the existing issue, not a new ticket. Anything deferred gets its `version_target` moved forward — not silently dropped.
-10. Announce in none with a link to the release note.
-11. Report: version, ticket count, anything deferred and why.
+10. **Promote the shipped tickets:** write status → `Released`, then mirror the tracker. Do **not** stamp `completed` here and never overwrite one already there — completion belongs to `Done`, which the team reaches on its own (including via `/fix-bug`), and a date invented at release time dates the forecast from the release rather than from the work. Board automations fire on a drag, never on frontmatter an agent writes, so whatever the `Released` drag would have mirrored is this step's job to do by hand. A tracker failure is a reported partial synchronization failure; retain the record and retry that operation on the existing issue, not a new ticket. Anything deferred gets its `version_target` moved forward — not silently dropped.
+11. Announce in none with a link to the release note.
+12. Report: version, ticket count, anything deferred and why, the path of the GitHub release text, and any link it had to leave out.
