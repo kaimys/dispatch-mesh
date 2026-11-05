@@ -4,7 +4,7 @@
 
 Dispatch Mesh synchronizes folders through Git while hiding Git mechanics from end users. It tracks editing sessions, records agent intent, and preserves recoverable conflicts. Read `README.md` for the supported behavior and CLI examples before changing the engine.
 
-The current application is a Rust console preview. Tray controls, guided account/repository setup, bundled Git, and login startup are future work. macOS and Linux builds precede the authenticated cloud MCP milestone, which is deferred to version 2.0. Do not present planned features as implemented.
+The current application is a Rust console preview plus a first Windows tray host in progress for 0.3 (status only). Conflict review and the rest of the tray controls, guided account/repository setup, bundled Git, and login startup are future work. macOS and Linux builds precede the authenticated cloud MCP milestone, which is deferred to version 2.0. Do not present planned features as implemented.
 
 ## Repository map
 
@@ -18,6 +18,7 @@ The current application is a Rust console preview. Tray controls, guided account
 - `src/transport.rs`: device manifests and native Git blobs.
 - `src/git.rs`: Git subprocess operations and path/object validation.
 - `src/ai.rs`: Chat Completions summaries, recorded intent, validation, and local fallback.
+- `tray/`: the `dispatch-mesh-tray` package (Tauri 2, ADR-0011/ADR-0012), a separate GUI executable in the Cargo workspace. `src/model.rs` holds all tray and window wording and state rules, `src/host.rs` runs one `RunnerHandle` per workspace, `src/tray.rs` the notification-area icon, `ui/` the static status window (no npm), `tests/host.rs` host tests with real workspaces. Icons are rendered by `scripts/tray_icons.py`.
 - `tests/`: CLI, engine, provider, and storage/transport integration tests.
 - `scripts/test_github_workflow.py`: optional live GitHub verification using isolated clients.
 - `dispatch/wiki/08_Delivery-and-QA/Reports/`: recorded verification results and known limitations (in the git-ignored wiki vault).
@@ -39,7 +40,7 @@ The current application is a Rust console preview. Tray controls, guided account
 
 ## Development and verification
 
-Requires Rust and Git on `PATH`. Typical commands, run from the repository root:
+Requires Rust and Git on `PATH`. The Cargo workspace builds the CLI and the tray host by default, so the commands below cover both; on Linux the tray needs the WebKitGTK/AppIndicator development packages listed in `.github/workflows/ci.yml`. Typical commands, run from the repository root:
 
 ```powershell
 cargo build --release
@@ -51,7 +52,7 @@ cargo test
 
 Use focused tests while developing, then run the relevant checks before delivery. Changes to synchronization, durability, attribution, or conflict ordering should have regression coverage that verifies observable behavior. Integration tests use temporary folders and local bare Git remotes; provider tests use a mock server and require no API key. Some engine tests take several minutes on Windows.
 
-Keep `Cargo.toml` and `Cargo.lock` consistent when changing the version. Update `README.md` when supported behavior or commands change. Build outputs belong in ignored `target/` and `dist/` directories.
+Keep `Cargo.toml` and `Cargo.lock` consistent when changing the version; the version lives once in `[workspace.package]` and applies to both executables. Update `README.md` when supported behavior or commands change. Build outputs belong in ignored `target/` and `dist/` directories.
 
 ## Live verification and user data
 

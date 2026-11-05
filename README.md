@@ -2,7 +2,7 @@
 
 Git-backed file synchronization with editing sessions, recorded agent intent, and recoverable conflicts.
 
-**0.2 console preview.** This is the first engine milestone from the concept's delivery sequence. It is intended for disposable test folders, not yet as the sole copy of important data. The tray application, guided account/repository setup, bundled Git, login startup, and authenticated cloud MCP server are not implemented yet.
+**0.2 console preview.** This is the first engine milestone from the concept's delivery sequence. It is intended for disposable test folders, not yet as the sole copy of important data. A first tray host for Windows is in progress for 0.3 (see [Tray (preview)](#tray-preview)); guided account/repository setup, bundled Git, login startup, and the authenticated cloud MCP server are not implemented yet.
 
 ## Build and run
 
@@ -50,7 +50,7 @@ For `needs_attention` and `offline`, `reason` names the cause; it never contains
 
 Only one runner may own a workspace. A second `run`, or a second embedded engine, stops with "Mesh is already running for this workspace" and starts nothing; try again once the first one has stopped. Every other command keeps working while a runner is active.
 
-Desktop hosts embed the same run loop in-process through `dispatch_mesh::runner::Runner::start`. The returned handle publishes the `status` snapshot plus the runner's current capture, sync and summary errors whenever they change, and `stop()` saves local work without waiting for pending network or AI requests, just as Ctrl+C does for `run`. This interface serves the planned tray application and is not yet a stable public API.
+Desktop hosts embed the same run loop in-process through `dispatch_mesh::runner::Runner::start`. The returned handle publishes the `status` snapshot plus the runner's current capture, sync and summary errors whenever they change, and `stop()` saves local work without waiting for pending network or AI requests, just as Ctrl+C does for `run`. The tray host below is built on it; it is not yet a stable public API.
 
 Git always runs with `LC_ALL=C`, so failures are classified the same way on any system language. On an HTTP 429 from the AI provider, Mesh separates exhausted quota or billing from a temporary rate limit (including the provider's retry delay) when the provider says which it is.
 
@@ -129,6 +129,22 @@ Run `status` first; `reason` tells you which case applies. Never delete `.mesh` 
 - **`needs_attention`, "AI summary failed: …".** Publication continues with a factual local message. Fix the API key, quota, or endpoint named in the message. The state clears with the next summary that does not fail, including one made after you remove the provider.
 - **Restoring a displaced file.** Open `.mesh/recovery/<id>/record.json` to find the original path, then copy `.mesh/recovery/<id>/content` back to that path (or anywhere else). The copy is an ordinary edit and enters a new session.
 
+## Tray (preview)
+
+`dispatch-mesh-tray.exe` is a separate Windows program that keeps one or more workspaces syncing from the notification area, without a console window. It is built next to the CLI and runs the same engine for each workspace; the CLI stays an ordinary console program.
+
+```powershell
+cargo build --release
+./target/release/dispatch-mesh-tray.exe --workspace C:/MeshDemo --workspace D:/Shared/Handbook
+```
+
+- Each `--workspace` must already be set up with `dispatch-mesh init`. Adding workspaces from the window comes with guided setup.
+- The icon shows the most urgent state of all workspaces: needs attention, offline, working (saved on this device, shared as draft, finishing up), or up to date. The tooltip names the state, and for attention the reason. State is told apart by the icon's badge shape, not by color alone.
+- Left-click opens the status window: each workspace's name, folder and state, with the reason for attention or offline. With several workspaces, it lists the most urgent first.
+- Closing the window only hides it; Mesh keeps syncing. **Quit** in the right-click menu captures saved changes and stops, without waiting for the network, just like Ctrl+C for `run`.
+- If a CLI `run` or another tray already runs a workspace, the window says so and offers **Retry**; the other workspaces keep running. CLI commands such as `status`, `sync`, `session finish` and `intent` keep working while the tray runs.
+- Not yet: conflict review, session detail, presence, Finish session and pause, notifications other than a one-time hint after the first close, login startup and an installer. On Linux, building needs the WebKitGTK and AppIndicator development packages (see `.github/workflows/ci.yml`).
+
 ## Preview boundaries
 
 - Plain regular files with UTF-8 paths; binary contents are supported. Symlinks, reparse points, submodules, executable file modes, Windows reserved names, and case-colliding paths are unsupported.
@@ -138,7 +154,7 @@ Run `status` first; `reason` tells you which case applies. Never delete `.mesh` 
 - Same-file dependencies can delay permanent publication until upstream sessions finish. Draft ordering uses explicit dependencies and a stable timestamp/ID order for independent sessions; distributed conflict display policy is experimental.
 - Git network operations run on a separate worker and release the workspace operation lock while waiting on the remote. The worker reloads durable state before continuing, preserving edits captured during the request. One network cycle runs at a time; local merge/apply phases can still briefly hold the operation lock.
 - Connecting an existing Git checkout does not yet import its local history automatically. Use a fresh folder with the remote option for an existing shared repository. Manual Git interoperability is outside the initial supported workflow.
-- No tray/status window, desktop notifications, guided repository creation, bundled Git, installer, login startup, editor presence integration, or authenticated remote MCP yet. CLI status and conflict commands expose the underlying engine operations for this milestone.
+- The tray host shows status only; conflict review, notifications, guided repository creation, bundled Git, installer, login startup, editor presence integration, and authenticated remote MCP are not available yet. CLI status and conflict commands expose the underlying engine operations for this milestone.
 
 ## Verification
 
