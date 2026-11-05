@@ -16,3 +16,19 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test -- --test-threads=2
+      # Failure classification must not depend on the user's language. Git for
+      # Windows on the dev machines ships no translations, so prove it here on a
+      # Git that really prints German; the guard keeps the check from passing
+      # trivially if translations ever go missing.
+      - name: Locale independence with a translating Git
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo locale-gen de_DE.UTF-8
+          german=$(LANG=de_DE.UTF-8 LC_ALL=de_DE.UTF-8 LANGUAGE=de git -C "$(mktemp -d)" status 2>&1 || true)
+          echo "Git under de_DE.UTF-8: $german"
+          if ! grep -q "Kein Git-Repository" <<<"$german"; then
+            echo "::error::Git does not print German messages here, so the locale test would prove nothing"
+            exit 1
+          fi
+          cargo test --test cli failure_classification_does_not_depend_on_the_user_locale
