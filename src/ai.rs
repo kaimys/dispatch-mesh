@@ -182,60 +182,122 @@ pub fn classify_too_many_requests(retry_after: Option<&str>, body: &[u8]) -> Str
     http_failure(reqwest::StatusCode::TOO_MANY_REQUESTS)
 }
 
-/// Seconds to wait according to a `Retry-After` value: either delta-seconds or
-/// an HTTP date (IMF-fixdate, the form RFC 9110 requires senders to use). A
-/// date in the past means "now" (0). Malformed or obsolete date formats yield
-/// `None`, which callers report as a generic "retry later".
+/// Seconds to wait according to a `Retry-After` value: delta-seconds or an
+/// HTTP-date in any of the three forms RFC 9110 §5.6.7 requires recipients to
+/// accept. A date in the past means "now" (0). Malformed values, including
+/// impossible calendar dates, yield `None`, reported as a generic "retry later".
 pub fn retry_after_seconds(value: &str, now_unix: u64) -> Option<u64> {
     let value = value.trim();
     if let Ok(seconds) = value.parse::<u64>() {
         return Some(seconds);
     }
-    imf_fixdate_unix(value).map(|date| date.saturating_sub(now_unix))
+    http_date_unix(value, now_unix).map(|date| date.saturating_sub(now_unix))
 }
 
-/// Parse `Sun, 06 Nov 1994 08:49:37 GMT` into Unix seconds.
-fn imf_fixdate_unix(value: &str) -> Option<u64> {
-    let parts: Vec<_> = value.split_ascii_whitespace().collect();
-    let [weekday, day, month, year, time, "GMT"] = parts.as_slice() else {
-        return None;
-    };
-    const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    if !DAYS
-        .iter()
-        .any(|name| weekday.strip_suffix(',') == Some(name))
-    {
-        return None;
-    }
-    let number = |text: &str, digits: usize| {
-        (text.len() == digits && text.bytes().all(|b| b.is_ascii_digit()))
+const SHORT_DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const LONG_DAYS: [&str; 7] = [
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Parse an HTTP-date into Unix seconds:
+/// - IMF-fixdate `Sun, 06 Nov 1994 08:49:37 GMT` (preferred),
+/// - RFC 850     `Sunday, 06-Nov-94 08:49:37 GMT` (obsolete, two-digit year),
+/// - asctime     `Sun Nov  6 08:49:37 1994` (obsolete, always GMT).
+fn http_date_unix(value: &str, now_unix: u64) -> Option<u64> {
+    let digits = |text: &str, min: usize, max: usize| {
+        ((min..=max).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_digit()))
             .then(|| text.parse::<i64>().ok())
             .flatten()
     };
-    let day = number(day, 2)?;
-    let month = MONTHS.iter().position(|name| name == month)? as i64 + 1;
-    let year = number(year, 4)?;
+    let month_number = |name: &str| MONTHS.iter().position(|m| *m == name).map(|i| i as i64 + 1);
+    let comma_day = |text: &str, names: &[&str]| {
+        text.strip_suffix(',')
+            .is_some_and(|day| names.contains(&day))
+    };
+    let parts: Vec<_> = value.split_ascii_whitespace().collect();
+    let (year, month, day, time) = match parts.as_slice() {
+        [weekday, day, month, year, time, "GMT"] if comma_day(weekday, &SHORT_DAYS) => (
+            digits(year, 4, 4)?,
+            month_number(month)?,
+            digits(day, 2, 2)?,
+            *time,
+        ),
+        [weekday, date, time, "GMT"] if comma_day(weekday, &LONG_DAYS) => {
+            let [day, month, year] = date.split('-').collect::<Vec<_>>()[..] else {
+                return None;
+            };
+            let year = full_year(digits(year, 2, 2)?, now_unix);
+            (year, month_number(month)?, digits(day, 2, 2)?, *time)
+        }
+        [weekday, month, day, time, year] if SHORT_DAYS.contains(weekday) => (
+            digits(year, 4, 4)?,
+            month_number(month)?,
+            digits(day, 1, 2)?,
+            *time,
+        ),
+        _ => return None,
+    };
     let mut clock = time.split(':');
     let (hour, minute, second) = (
-        number(clock.next()?, 2)?,
-        number(clock.next()?, 2)?,
-        number(clock.next()?, 2)?,
+        digits(clock.next()?, 2, 2)?,
+        digits(clock.next()?, 2, 2)?,
+        digits(clock.next()?, 2, 2)?,
     );
-    if clock.next().is_some() || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60
+    // Reject impossible dates instead of normalizing e.g. 31 Feb into March.
+    if clock.next().is_some()
+        || !(1..=days_in_month(year, month)).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
     {
         return None;
     }
-    // Days since 1970-01-01 in the proleptic Gregorian calendar (H. Hinnant).
+    let seconds = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second;
+    u64::try_from(seconds).ok()
+}
+
+/// RFC 9110 §5.6.7: a two-digit year that appears more than 50 years in the
+/// future is the most recent past year with the same last two digits.
+fn full_year(two_digits: i64, now_unix: u64) -> i64 {
+    let now_days = (now_unix / 86_400) as i64;
+    let mut current = 1970 + now_days / 366;
+    while days_from_civil(current + 1, 1, 1) <= now_days {
+        current += 1;
+    }
+    let candidate = current - current.rem_euclid(100) + two_digits;
+    if candidate > current + 50 {
+        candidate - 100
+    } else {
+        candidate
+    }
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+/// Days since 1970-01-01 in the proleptic Gregorian calendar (H. Hinnant).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let shifted = if month <= 2 { year - 1 } else { year };
     let era = shifted.div_euclid(400);
     let year_of_era = shifted - era * 400;
     let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    let days = era * 146_097 + day_of_era - 719_468;
-    u64::try_from(days * 86_400 + hour * 3_600 + minute * 60 + second).ok()
+    era * 146_097 + day_of_era - 719_468
 }
 
 fn http_failure(status: reqwest::StatusCode) -> String {

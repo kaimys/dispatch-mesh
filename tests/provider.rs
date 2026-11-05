@@ -555,16 +555,96 @@ fn retry_after_accepts_delta_seconds_and_http_dates() {
         Some(0),
         "an elapsed date means retry now, never a negative delay"
     );
+
+    // RFC 9110 §5.6.7: recipients accept all three HTTP-date forms. The
+    // obsolete forms denote the same instant as the preferred one.
+    for same_instant in [
+        "Sun, 06 Nov 1994 08:49:37 GMT",  // IMF-fixdate
+        "Sunday, 06-Nov-94 08:49:37 GMT", // RFC 850
+        "Sun Nov  6 08:49:37 1994",       // asctime
+    ] {
+        assert_eq!(
+            ai::retry_after_seconds(same_instant, rfc_example - 60),
+            Some(60),
+            "future: {same_instant}"
+        );
+        assert_eq!(
+            ai::retry_after_seconds(same_instant, rfc_example + 60),
+            Some(0),
+            "elapsed: {same_instant}"
+        );
+    }
+    // RFC 850's two-digit year: more than 50 years ahead means the past century.
+    let now_2026 = 1_793_883_600; // Thu, 05 Nov 2026 13:00:00 GMT
+    assert_eq!(
+        ai::retry_after_seconds("Thursday, 05-Nov-26 13:01:30 GMT", now_2026),
+        Some(90)
+    );
+    assert_eq!(
+        ai::retry_after_seconds("Wednesday, 01-Jan-76 00:00:00 GMT", now_2026),
+        Some(3_345_062_400 - now_2026),
+        "2076 is exactly 50 years ahead, so it stays in this century"
+    );
+    assert_eq!(
+        ai::retry_after_seconds("Tuesday, 01-Jan-80 00:00:00 GMT", now_2026),
+        Some(0),
+        "2080 is more than 50 years ahead, so it means 1980 (elapsed)"
+    );
+    assert_eq!(
+        ai::retry_after_seconds("Tue Feb 29 00:00:00 2028", 1_835_395_200 - 1),
+        Some(1),
+        "asctime leap day"
+    );
+
     for malformed in [
-        "Sunday, 06-Nov-94 08:49:37 GMT", // obsolete RFC 850 form
-        "Sun Nov  6 08:49:37 1994",       // obsolete asctime form
         "Sun, 06 Nov 1994 25:00:00 GMT",
         "Sun, 06 Foo 1994 08:49:37 GMT",
         "Sun, 06 Nov 1994 08:49:37 UTC",
+        "Sun, 6 Nov 1994 08:49:37 GMT", // IMF-fixdate needs two-digit days
+        "Sunday, 06-Nov-1994 08:49:37 GMT", // RFC 850 needs a two-digit year
+        "Sun Nov  6 08:49:37 94",       // asctime needs a four-digit year
+        "Sun Nov  6 08:49:37 1994 GMT",
+        "Funday, 06-Nov-94 08:49:37 GMT",
+        // Impossible calendar dates are rejected, never normalized.
+        "Thu, 31 Feb 2028 00:00:00 GMT",
+        "Wed, 30 Feb 2028 00:00:00 GMT",
+        "Sun, 29 Feb 2027 00:00:00 GMT",
+        "Thu, 31 Apr 2026 00:00:00 GMT",
+        "Monday, 31-Apr-26 00:00:00 GMT",
+        "Sat Feb 30 00:00:00 2028",
+        "Sun, 00 Nov 1994 08:49:37 GMT",
         "-5",
         "soon",
     ] {
         assert_eq!(ai::retry_after_seconds(malformed, 0), None, "{malformed}");
+    }
+}
+
+#[tokio::test]
+async fn an_obsolete_http_date_reports_the_remaining_delay() {
+    let secret = "sk-test-sensitive-obsolete-date-body";
+    for header in [
+        "Retry-After: Friday, 31-Dec-99 23:59:59 GMT\r\n",
+        "Retry-After: Fri Dec 31 23:59:59 2100\r\n",
+    ] {
+        let error = too_many_requests_error(
+            header,
+            &json!({"error": {"message": secret, "code": "rate_limit_exceeded"}}).to_string(),
+        )
+        .await;
+        let seconds: u64 = error
+            .split("retry after ")
+            .nth(1)
+            .and_then(|rest| rest.split(" s").next())
+            .and_then(|number| number.parse().ok())
+            .unwrap_or_else(|| panic!("no retry delay for {header:?} in: {error}"));
+        if header.contains("-99") {
+            // Two-digit 99 is more than 50 years ahead of today, so it means 1999: elapsed.
+            assert_eq!(seconds, 0, "{error}");
+        } else {
+            assert!(seconds > 365 * 24 * 3_600, "{error}");
+        }
+        assert!(!error.contains(secret), "{error}");
     }
 }
 
