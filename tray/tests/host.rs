@@ -11,7 +11,7 @@ use dispatch_mesh_tray::{
 };
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex, mpsc},
     time::{Duration, Instant},
 };
 
@@ -206,4 +206,66 @@ fn a_host_without_workspaces_still_reports_once() {
     let (host, seen) = host(&[]);
     host.start_all();
     assert_eq!(seen.lock().unwrap().as_slice(), [Vec::<Workspace>::new()]);
+}
+
+#[test]
+fn quit_waits_for_a_start_in_flight_and_its_final_capture() {
+    let parent = tempfile::tempdir().unwrap();
+    let wiki = workspace(&parent, "Team Wiki");
+    std::fs::write(wiki.join("early.md"), "saved while starting").unwrap();
+
+    // Hold the start in flight: the listener blocks on the "Starting" report
+    // until the test opens the gate, like a slow UI callback.
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let (reached_tx, reached) = mpsc::channel();
+    let reached_tx = Mutex::new(Some(reached_tx));
+    let listener_gate = Arc::clone(&gate);
+    let host = Host::new([wiki.clone()], move |workspaces| {
+        if workspaces
+            .iter()
+            .any(|w| w.state == WorkspaceState::Starting)
+        {
+            if let Some(tx) = reached_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            let (open, opened) = &*listener_gate;
+            let _open = opened
+                .wait_while(open.lock().unwrap(), |open| !*open)
+                .unwrap();
+        }
+    })
+    .unwrap();
+    let starter = {
+        let host = Arc::clone(&host);
+        std::thread::spawn(move || host.start_all())
+    };
+    reached.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    let (done_tx, done) = mpsc::channel();
+    let quitter = {
+        let host = Arc::clone(&host);
+        std::thread::spawn(move || {
+            host.quit();
+            done_tx.send(()).unwrap();
+        })
+    };
+    assert!(
+        done.recv_timeout(Duration::from_millis(500)).is_err(),
+        "Quit returned while a workspace was still starting"
+    );
+
+    let (open, opened) = &*gate;
+    *open.lock().unwrap() = true;
+    opened.notify_all();
+    done.recv_timeout(Duration::from_secs(30))
+        .expect("Quit returns once the start has finished");
+    // By then the late engine has captured the edit and released the workspace.
+    assert!(captured(&wiki, "early.md", "saved while starting"));
+    drop(runner::acquire(&wiki).unwrap());
+    quitter.join().unwrap();
+    starter.join().unwrap();
+
+    // After Quit, no new engine starts.
+    host.start_all();
+    drop(runner::acquire(&wiki).unwrap());
 }

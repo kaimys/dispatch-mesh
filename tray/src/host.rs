@@ -10,7 +10,7 @@ use dispatch_mesh::runner::{AlreadyRunning, Runner, RunnerHandle, StatusReceiver
 use std::{
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Condvar, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -28,7 +28,30 @@ pub struct Host {
     entries: Mutex<Vec<Entry>>,
     listener: Box<Listener>,
     runtime: Option<tokio::runtime::Runtime>,
+    /// Set once Quit begins; read without a lock where a stale `false` is
+    /// harmless. It only changes while `starts` is locked.
     quitting: AtomicBool,
+    /// Starts in flight. Quit refuses new starts and waits for these, because
+    /// an engine that is still starting holds saved edits it must capture.
+    starts: Mutex<Starts>,
+    starts_done: Condvar,
+}
+
+#[derive(Default)]
+struct Starts {
+    quitting: bool,
+    in_flight: usize,
+}
+
+/// Counts one start as in flight until it is dropped, even on a panic.
+struct StartGuard<'a>(&'a Host);
+
+impl Drop for StartGuard<'_> {
+    fn drop(&mut self) {
+        let mut starts = self.0.starts.lock().unwrap_or_else(|e| e.into_inner());
+        starts.in_flight -= 1;
+        self.0.starts_done.notify_all();
+    }
 }
 
 /// A friendly name for a workspace: its folder name.
@@ -83,6 +106,8 @@ impl Host {
             listener: Box::new(listener),
             runtime: Some(runtime),
             quitting: AtomicBool::new(false),
+            starts: Mutex::new(Starts::default()),
+            starts_done: Condvar::new(),
         }))
     }
 
@@ -124,9 +149,16 @@ impl Host {
     }
 
     fn start(self: &Arc<Self>, id: usize) {
-        if self.quitting.load(Ordering::SeqCst) {
-            return;
+        {
+            let mut starts = self.starts.lock().unwrap();
+            if starts.quitting {
+                return;
+            }
+            starts.in_flight += 1;
         }
+        // Released after the last notification below, so Quit returns only
+        // once this start has finished, including a late engine's final capture.
+        let _in_flight = StartGuard(self);
         let (path, generation) = {
             let mut entries = self.entries.lock().unwrap();
             let entry = &mut entries[id];
@@ -159,7 +191,8 @@ impl Host {
                 Err(error) => entry.workspace.state = WorkspaceState::Stopped(format!("{error:#}")),
             }
         }
-        // Quit began while this engine started: dropping it stops and joins it.
+        // Quit began while this engine started: dropping it stops it and waits
+        // for its final capture, before this start counts as finished.
         drop(late);
         self.notify();
     }
@@ -221,9 +254,15 @@ impl Host {
     }
 
     /// Stop every engine and wait for each to capture saved changes. Engines
-    /// stop in parallel; none waits for network or AI work (ADR-0009).
+    /// stop in parallel; none waits for network or AI work (ADR-0009). Starts
+    /// already under way finish and stop their engine before this returns;
+    /// later starts are refused. Holds no lock while listeners run.
     pub fn quit(&self) {
-        self.quitting.store(true, Ordering::SeqCst);
+        {
+            let mut starts = self.starts.lock().unwrap();
+            starts.quitting = true;
+            self.quitting.store(true, Ordering::SeqCst);
+        }
         let handles: Vec<RunnerHandle> = self
             .entries
             .lock()
@@ -237,6 +276,11 @@ impl Host {
         for handle in handles {
             let _ = handle.join();
         }
+        let starts = self.starts.lock().unwrap();
+        let _finished = self
+            .starts_done
+            .wait_while(starts, |starts| starts.in_flight > 0)
+            .unwrap();
     }
 }
 
