@@ -1,6 +1,6 @@
-//! Workspace status as reported by `status` and, later, published to desktop
-//! hosts. The model is decided in ADR-0010: one workspace summary with a fixed
-//! precedence, plus a stage per session.
+//! Workspace status as reported by `status` and published to desktop hosts by
+//! the runner (ADR-0009). The model is decided in ADR-0010: one workspace
+//! summary with a fixed precedence, plus a stage per session.
 //!
 //! Computing a snapshot never writes state or takes the workspace operation
 //! lock, so it works on a read-only `Workspace::inspect` (ADR-0007).
@@ -82,6 +82,15 @@ pub struct Status {
     pub presence: Vec<Presence>,
 }
 
+/// What is known about the live folder beyond committed state.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LocalObservation {
+    /// Saved files differ from the last captured view.
+    pub changes_waiting: bool,
+    /// Why the live folder could not be read, if it could not.
+    pub capture_error: Option<String>,
+}
+
 impl Workspace {
     /// Where a session is on its way to `main`. Sessions received from another
     /// device reached us through the remote, so they are uploaded by definition;
@@ -104,12 +113,25 @@ impl Workspace {
         }
     }
 
+    /// Status as the CLI reports it: scans the live folder, read-only.
     pub fn status_snapshot(&self) -> Status {
         let scan = self.scan();
-        let capture_error = scan.as_ref().err().map(|error| format!("{error:#}"));
-        let local_changes_waiting = scan
-            .as_ref()
-            .is_ok_and(|files| files != &self.state.observed);
+        self.status_from(LocalObservation {
+            capture_error: scan.as_ref().err().map(|error| format!("{error:#}")),
+            changes_waiting: scan
+                .as_ref()
+                .is_ok_and(|files| files != &self.state.observed),
+        })
+    }
+
+    /// Status from committed state plus what the caller already knows about the
+    /// live folder. The runner supplies its own capture results here, so
+    /// publishing a snapshot every tick costs no extra scan.
+    pub fn status_from(&self, local: LocalObservation) -> Status {
+        let LocalObservation {
+            changes_waiting: local_changes_waiting,
+            capture_error,
+        } = local;
         let unresolved: Vec<_> = self
             .unresolved()
             .map(|c| ConflictStatus {

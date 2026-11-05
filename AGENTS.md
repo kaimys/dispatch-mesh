@@ -8,7 +8,9 @@ The current application is a Rust console preview. Tray controls, guided account
 
 ## Repository map
 
-- `src/main.rs`: CLI commands, watcher, capture loop, and synchronization scheduling.
+- `src/main.rs`: CLI commands.
+- `src/runner.rs`: run loop shared by CLI `run` and desktop hosts: watcher, capture, synchronization scheduling, summaries, published status snapshots, and the `Runner`/`RunnerHandle` host interface.
+- `src/status.rs`: workspace status and session stages, computed without the operation lock.
 - `src/engine.rs`: workspace operations, sessions, integration, conflict resolution, and publication.
 - `src/model.rs`: configuration and durable domain types.
 - `src/storage.rs`: SQLite persistence and migration.

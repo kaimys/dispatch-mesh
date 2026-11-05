@@ -48,6 +48,10 @@ The top-level `status` is one workspace summary. When several apply, the first i
 
 For `needs_attention` and `offline`, `reason` names the cause; it never contains credentials, Git's raw error output, or provider response bodies. Each entry in `sessions` carries a `stage`: `saved_locally` → `draft_uploaded` → `waiting_for_finalization` → `published`, or `discarded`. Sessions received from other devices are uploaded by definition; a workspace without a remote has no upload stage. The raw `attention`, `offline`, `summary_failure`, `capture_error`, `local_changes_waiting`, and `recovery_pending` fields remain available. Earlier previews reported `waiting_to_sync`; that value no longer appears.
 
+Only one runner may own a workspace. A second `run`, or a second embedded engine, stops with "Mesh is already running for this workspace" and starts nothing; try again once the first one has stopped. Every other command keeps working while a runner is active.
+
+Desktop hosts embed the same run loop in-process through `dispatch_mesh::runner::Runner::start`. The returned handle publishes the `status` snapshot plus the runner's current capture, sync and summary errors whenever they change, and `stop()` saves local work without waiting for pending network or AI requests, just as Ctrl+C does for `run`. This interface serves the planned tray application and is not yet a stable public API.
+
 Git always runs with `LC_ALL=C`, so failures are classified the same way on any system language. On an HTTP 429 from the AI provider, Mesh separates exhausted quota or billing from a temporary rate limit (including the provider's retry delay) when the provider says which it is.
 
 ## Agents and intent
