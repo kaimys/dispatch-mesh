@@ -1,6 +1,6 @@
 [package]
 name = "dispatch-mesh"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 description = "Git-backed synchronization with editing sessions and recorded intent"
 
