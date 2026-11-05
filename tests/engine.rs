@@ -826,20 +826,35 @@ fn unclassified_sync_failures_and_ai_failures_need_attention_with_a_reason() {
 #[test]
 fn a_failed_sync_records_its_cause_even_when_another_operation_holds_the_lock() {
     use std::{
+        io::{Read, Write},
         net::TcpListener,
         sync::mpsc,
         time::{Duration, Instant},
     };
     let temp = TempDir::new().unwrap();
-    // A loopback remote that accepts, stalls, and hangs up without answering.
+    // A loopback remote that stalls, then answers HTTP 500. A server error is
+    // an unclassified Git failure (`needs_attention`) on every platform; a bare
+    // hang-up is not portable: Windows curl reports "Empty reply from server",
+    // Linux curl "Connection reset by peer" (offline).
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/repo.git", listener.local_addr().unwrap());
     let (network_started, network_signal) = mpsc::channel();
     std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
+        for mut stream in listener.incoming().flatten() {
             let _ = network_started.send(());
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => request.extend_from_slice(&chunk[..count]),
+                }
+            }
             std::thread::sleep(Duration::from_secs(1));
-            drop(stream);
+            let _ = stream.write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
         }
     });
     let mut alice = init(&temp.path().join("alice"), "Alice", None);
