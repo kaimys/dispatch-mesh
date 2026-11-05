@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The status window may listen to host events and call the host's own commands.",
+  "windows": ["main"],
+  "permissions": ["core:event:default"]
+}

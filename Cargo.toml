@@ -1,7 +1,18 @@
-[package]
-name = "dispatch-mesh"
+[workspace]
+# The tray host is a separate GUI executable sharing the engine library (ADR-0012).
+# Both are default members, so the standard gates build and test both.
+members = [".", "tray"]
+default-members = [".", "tray"]
+
+[workspace.package]
+# One version for the CLI and the tray host; `/release` bumps it here.
 version = "0.2.5"
 edition = "2024"
+
+[package]
+name = "dispatch-mesh"
+version.workspace = true
+edition.workspace = true
 description = "Git-backed synchronization with editing sessions and recorded intent"
 
 [dependencies]

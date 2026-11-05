@@ -1,0 +1,209 @@
+//! The tray host with real workspaces and no window (US00001).
+
+use dispatch_mesh::{
+    engine::{Workspace as Engine, WorkspaceBusy},
+    model::Identity,
+    runner,
+};
+use dispatch_mesh_tray::{
+    host::Host,
+    model::{Workspace, WorkspaceState},
+};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+fn init(root: &Path) -> PathBuf {
+    Engine::init(
+        root,
+        Identity {
+            name: "Alice".into(),
+            email: "alice@example.test".into(),
+        },
+        None,
+        "main".into(),
+    )
+    .unwrap()
+    .root
+    .clone()
+}
+
+fn workspace(parent: &tempfile::TempDir, name: &str) -> PathBuf {
+    let root = parent.path().join(name);
+    std::fs::create_dir(&root).unwrap();
+    init(&root)
+}
+
+/// Every list of workspaces the listener received.
+type Heard = Arc<Mutex<Vec<Vec<Workspace>>>>;
+
+/// A host whose listener keeps every notification.
+fn host(paths: &[PathBuf]) -> (Arc<Host>, Heard) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let host = Host::new(paths.iter().cloned(), move |workspaces| {
+        sink.lock().unwrap().push(workspaces)
+    })
+    .unwrap();
+    (host, seen)
+}
+
+fn wait_until(host: &Host, what: &str, accept: impl Fn(&[Workspace]) -> bool) -> Vec<Workspace> {
+    let started = Instant::now();
+    loop {
+        let workspaces = host.workspaces();
+        if accept(&workspaces) {
+            return workspaces;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "{what}: {workspaces:#?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn published(workspace: &Workspace) -> bool {
+    matches!(workspace.state, WorkspaceState::Running(Some(_)))
+}
+
+fn captured(root: &Path, path: &str, content: &str) -> bool {
+    let engine = loop {
+        match Engine::open(root) {
+            Ok(engine) => break engine,
+            Err(error) if error.is::<WorkspaceBusy>() => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            Err(error) => panic!("{error:#}"),
+        }
+    };
+    engine.state.manifest.sessions.values().any(|session| {
+        session
+            .changes
+            .get(path)
+            .is_some_and(|change| change.content.as_deref() == Some(content.as_bytes()))
+    })
+}
+
+#[test]
+fn several_workspaces_run_side_by_side_and_publish() {
+    let parent = tempfile::tempdir().unwrap();
+    let wiki = workspace(&parent, "Team Wiki");
+    let notes = workspace(&parent, "Research notes");
+    // The same folder twice is one workspace, not a refused second engine.
+    let (host, seen) = host(&[wiki.clone(), notes.clone(), wiki.clone()]);
+    host.start_all();
+    let workspaces = wait_until(&host, "both publish", |w| w.iter().all(published));
+    let names: Vec<_> = workspaces.iter().map(|w| w.name.as_str()).collect();
+    assert_eq!(names, ["Team Wiki", "Research notes"]);
+    assert_eq!(workspaces[0].path, wiki);
+    assert!(
+        !seen.lock().unwrap().is_empty(),
+        "the listener heard the changes"
+    );
+
+    std::fs::write(notes.join("note.md"), "hello").unwrap();
+    wait_until(&host, "the edit reaches the snapshot", |w| {
+        matches!(&w[1].state, WorkspaceState::Running(Some(s))
+            if s.status.sessions.iter().any(|session| session.files.iter().any(|f| f == "note.md")))
+    });
+    host.quit();
+}
+
+#[test]
+fn a_held_workspace_is_refused_while_the_others_run_and_retry_starts_it_later() {
+    let parent = tempfile::tempdir().unwrap();
+    let held = workspace(&parent, "Held");
+    let free = workspace(&parent, "Free");
+    let lease = runner::acquire(&held).unwrap();
+    let (host, _) = host(&[held.clone(), free]);
+    host.start_all();
+    let workspaces = wait_until(&host, "held refused, free runs", |w| {
+        w[0].state == WorkspaceState::AlreadyRunning && published(&w[1])
+    });
+    assert_eq!(workspaces[0].name, "Held");
+
+    host.retry(0);
+    assert_eq!(
+        host.workspaces()[0].state,
+        WorkspaceState::AlreadyRunning,
+        "still held"
+    );
+
+    drop(lease);
+    host.retry(0);
+    wait_until(&host, "retry starts it once released", |w| published(&w[0]));
+    // Retrying a running workspace is ignored: no second engine, no refusal.
+    host.retry(0);
+    assert!(published(&host.workspaces()[0]));
+    host.quit();
+}
+
+#[test]
+fn a_second_host_is_refused_per_workspace() {
+    let parent = tempfile::tempdir().unwrap();
+    let wiki = workspace(&parent, "Team Wiki");
+    let (first, _) = host(std::slice::from_ref(&wiki));
+    first.start_all();
+    wait_until(&first, "first host runs", |w| published(&w[0]));
+    let (second, _) = host(&[wiki]);
+    second.start_all();
+    wait_until(&second, "second host refused", |w| {
+        w[0].state == WorkspaceState::AlreadyRunning
+    });
+    first.quit();
+    second.retry(0);
+    wait_until(
+        &second,
+        "second host takes over after the first quits",
+        |w| published(&w[0]),
+    );
+    second.quit();
+}
+
+#[test]
+fn quit_captures_an_edit_saved_just_before() {
+    let parent = tempfile::tempdir().unwrap();
+    let wiki = workspace(&parent, "Team Wiki");
+    let (host, _) = host(std::slice::from_ref(&wiki));
+    host.start_all();
+    wait_until(&host, "runs", |w| published(&w[0]));
+    std::fs::write(wiki.join("last.md"), "saved before quit").unwrap();
+    host.quit();
+    assert!(captured(&wiki, "last.md", "saved before quit"));
+    // The runner lock is released: a CLI `run` or another host could start now.
+    drop(runner::acquire(&wiki).unwrap());
+}
+
+#[test]
+fn a_folder_that_is_not_a_workspace_is_stopped_with_a_reason_and_can_be_retried() {
+    let parent = tempfile::tempdir().unwrap();
+    let plain = parent.path().join("Plain");
+    std::fs::create_dir(&plain).unwrap();
+    let (host, _) = host(std::slice::from_ref(&plain));
+    host.start_all();
+    let workspaces = wait_until(&host, "stopped", |w| {
+        matches!(w[0].state, WorkspaceState::Stopped(_))
+    });
+    let WorkspaceState::Stopped(reason) = &workspaces[0].state else {
+        unreachable!()
+    };
+    assert!(
+        reason.contains("not a Mesh workspace") && reason.contains("init"),
+        "{reason}"
+    );
+
+    init(&plain);
+    host.retry(0);
+    wait_until(&host, "runs after init", |w| published(&w[0]));
+    host.quit();
+}
+
+#[test]
+fn a_host_without_workspaces_still_reports_once() {
+    let (host, seen) = host(&[]);
+    host.start_all();
+    assert_eq!(seen.lock().unwrap().as_slice(), [Vec::<Workspace>::new()]);
+}

@@ -1,0 +1,75 @@
+/* Tokens from the Claude Design token sheet (deliverable 6). Flat fills,
+   1 px lines, nothing a native toolkit couldn't draw. */
+:root {
+  --ground: #F7F7F5;
+  --surface: #FFFFFF;
+  --line: #E3E2DE;
+  --line-strong: #C9C8C3;
+  --text: #1C1D1F;
+  --text-2: #3D3F44;
+  --text-3: #55575C;
+  --action: #2457C5;
+  --synced: #2F6B4F;
+  --working: #2457C5;
+  --offline: #4A5568;
+  --attention: #B4490B;
+  --attention-tint: #FDF1E7;
+  --glyph: #FFFFFF;
+  --mono: "Cascadia Mono", Consolas, ui-monospace, monospace;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ground: #1B1C1E;
+    --surface: #242528;
+    --line: #34363A;
+    --line-strong: #4A4C51;
+    --text: #ECECEA;
+    --text-2: #C4C5C8;
+    --text-3: #A2A5AA;
+    --action: #7FA6FF;
+    --synced: #6FBF97;
+    --working: #7FA6FF;
+    --offline: #A7ADB8;
+    --attention: #FF9E57;
+    --attention-tint: #3A2618;
+    --glyph: #14161A;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--ground); color: var(--text); overflow-x: hidden; }
+body { font: 13px/1.45 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; }
+main { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+h1 { font-size: 18px; font-weight: 600; margin: 0; }
+h2 { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--text-3); margin: 0; }
+p { margin: 0; }
+.muted { color: var(--text-3); }
+.path { font: 12px var(--mono); color: var(--text-3); overflow-wrap: anywhere; }
+
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
+.card.attention { background: var(--attention-tint); border-color: var(--attention); }
+.state { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 14px; }
+.state svg { flex: none; }
+.card.attention .state { color: var(--attention); }
+.card.offline .state { color: var(--offline); }
+.reason { color: var(--text-2); overflow-wrap: anywhere; }
+
+button { font: inherit; color: inherit; }
+.primary, .secondary { border-radius: 4px; padding: 6px 14px; cursor: pointer; align-self: flex-start; }
+.primary { background: var(--action); color: var(--glyph); border: 1px solid var(--action); }
+.secondary { background: var(--surface); border: 1px solid var(--line-strong); }
+.link { background: none; border: 0; padding: 0; color: var(--action); cursor: pointer; align-self: flex-start; }
+button:focus-visible { outline: 2px solid var(--action); outline-offset: 2px; }
+
+.list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.row { width: 100%; text-align: left; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px; cursor: pointer; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; }
+.row:hover { border-color: var(--line-strong); }
+.row svg { grid-row: span 3; margin-top: 2px; }
+.row .name { font-weight: 600; }
+.row .label { color: var(--text-2); overflow-wrap: anywhere; }
+.row.attention .label { color: var(--attention); }
+
+code { font: 12px var(--mono); background: var(--ground); border: 1px solid var(--line); border-radius: 4px; padding: 1px 4px; overflow-wrap: anywhere; }
+
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }

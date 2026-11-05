@@ -13,6 +13,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # The tray host (Tauri 2, ADR-0011) is a default workspace member, so every
+      # gate builds it; on Linux that needs WebKitGTK and AppIndicator headers.
+      - name: Tauri system packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test -- --test-threads=2

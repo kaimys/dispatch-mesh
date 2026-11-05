@@ -1,0 +1,33 @@
+[package]
+name = "dispatch-mesh-tray"
+version.workspace = true
+edition.workspace = true
+description = "Dispatch Mesh tray host: runs the engine for one or more workspaces and shows their status"
+
+[lib]
+name = "dispatch_mesh_tray"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dispatch-mesh-tray"
+path = "src/main.rs"
+
+[dependencies]
+dispatch-mesh = { path = ".." }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dunce = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2.12", features = ["tray-icon", "image-png"] }
+tauri-plugin-notification = "2.8"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Registry"] }
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Dispatch Mesh",
+  "identifier": "de.eightnine.mesh",
+  "build": { "frontendDist": "ui" },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Dispatch Mesh",
+        "width": 440,
+        "height": 520,
+        "minWidth": 380,
+        "minHeight": 360,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": { "active": false, "icon": ["icons/icon.ico"] }
+}
