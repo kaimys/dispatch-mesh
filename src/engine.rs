@@ -228,18 +228,12 @@ impl Workspace {
         self.save()?;
         drop(self._lock.take());
         let result = operation(&self.git);
-        let started = std::time::Instant::now();
-        let lock = loop {
-            match operation_lock(&self.root.join(".mesh"), "lock") {
-                Ok(lock) => break lock,
-                Err(error)
-                    if error.is::<WorkspaceBusy>()
-                        && started.elapsed() < std::time::Duration::from_secs(5) =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(25))
-                }
-                Err(error) => return Err(error),
-            }
+        let lock = match self.acquire_lock(std::time::Duration::from_secs(5)) {
+            Ok(lock) => lock,
+            // Never let lock contention hide why the network operation failed:
+            // callers record that cause (sync_and_record), and re-acquire first.
+            Err(_) if result.is_err() => return result,
+            Err(error) => return Err(error),
         };
         self._lock = Some(lock);
         self.state = storage::load(&self.db)?;
@@ -765,15 +759,43 @@ impl Workspace {
     pub fn sync_and_record(root: &Path) -> Result<()> {
         let mut workspace = Workspace::open(root)?;
         let result = workspace.sync();
-        drop(workspace);
         if let Err(error) = &result
             && !error.is::<WorkspaceBusy>()
-            && let Ok(mut workspace) = Workspace::open(root)
+            && let Err(unrecorded) = workspace.persist_sync_failure(error)
         {
-            workspace.record_sync_failure(error);
-            workspace.save()?;
+            return result.map_err(|error| {
+                error.context(format!("The failure could not be recorded: {unrecorded:#}"))
+            });
         }
         result
+    }
+
+    /// Persist a sync failure while owning the operation lock. The workspace
+    /// normally still holds it; if a network step lost it to a concurrent
+    /// capture, wait for it instead of dropping the outcome. Whatever the
+    /// failed sync left half-applied in memory is discarded: the cause is
+    /// recorded against durable state, as a fresh open would see it.
+    fn persist_sync_failure(&mut self, error: &anyhow::Error) -> Result<()> {
+        if self._lock.is_none() {
+            self._lock = Some(self.acquire_lock(std::time::Duration::from_secs(30))?);
+        }
+        self.state = storage::load(&self.db)?;
+        self.record_sync_failure(error);
+        self.save()
+    }
+
+    /// Take the operation lock, retrying while another operation holds it.
+    fn acquire_lock(&self, timeout: std::time::Duration) -> Result<File> {
+        let started = std::time::Instant::now();
+        loop {
+            match operation_lock(&self.root.join(".mesh"), "lock") {
+                Ok(lock) => return Ok(lock),
+                Err(error) if error.is::<WorkspaceBusy>() && started.elapsed() < timeout => {
+                    std::thread::sleep(std::time::Duration::from_millis(25))
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Record why a sync failed. An unreachable remote is `offline`; every other

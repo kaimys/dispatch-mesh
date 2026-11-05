@@ -169,7 +169,10 @@ pub fn classify_too_many_requests(retry_after: Option<&str>, body: &[u8]) -> Str
         return "Provider returned HTTP 429: provider quota or billing exhausted; check the provider account".to_string();
     }
     if is("rate_limit") || retry_after.is_some() {
-        return match retry_after.and_then(|value| value.parse::<u64>().ok()) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        return match retry_after.and_then(|value| retry_after_seconds(value, now)) {
             Some(seconds) => {
                 format!("Provider returned HTTP 429: temporary rate limit; retry after {seconds} s")
             }
@@ -177,6 +180,62 @@ pub fn classify_too_many_requests(retry_after: Option<&str>, body: &[u8]) -> Str
         };
     }
     http_failure(reqwest::StatusCode::TOO_MANY_REQUESTS)
+}
+
+/// Seconds to wait according to a `Retry-After` value: either delta-seconds or
+/// an HTTP date (IMF-fixdate, the form RFC 9110 requires senders to use). A
+/// date in the past means "now" (0). Malformed or obsolete date formats yield
+/// `None`, which callers report as a generic "retry later".
+pub fn retry_after_seconds(value: &str, now_unix: u64) -> Option<u64> {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(seconds);
+    }
+    imf_fixdate_unix(value).map(|date| date.saturating_sub(now_unix))
+}
+
+/// Parse `Sun, 06 Nov 1994 08:49:37 GMT` into Unix seconds.
+fn imf_fixdate_unix(value: &str) -> Option<u64> {
+    let parts: Vec<_> = value.split_ascii_whitespace().collect();
+    let [weekday, day, month, year, time, "GMT"] = parts.as_slice() else {
+        return None;
+    };
+    const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    if !DAYS
+        .iter()
+        .any(|name| weekday.strip_suffix(',') == Some(name))
+    {
+        return None;
+    }
+    let number = |text: &str, digits: usize| {
+        (text.len() == digits && text.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| text.parse::<i64>().ok())
+            .flatten()
+    };
+    let day = number(day, 2)?;
+    let month = MONTHS.iter().position(|name| name == month)? as i64 + 1;
+    let year = number(year, 4)?;
+    let mut clock = time.split(':');
+    let (hour, minute, second) = (
+        number(clock.next()?, 2)?,
+        number(clock.next()?, 2)?,
+        number(clock.next()?, 2)?,
+    );
+    if clock.next().is_some() || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60
+    {
+        return None;
+    }
+    // Days since 1970-01-01 in the proleptic Gregorian calendar (H. Hinnant).
+    let shifted = if month <= 2 { year - 1 } else { year };
+    let era = shifted.div_euclid(400);
+    let year_of_era = shifted - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    u64::try_from(days * 86_400 + hour * 3_600 + minute * 60 + second).ok()
 }
 
 fn http_failure(status: reqwest::StatusCode) -> String {

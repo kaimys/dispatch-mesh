@@ -531,3 +531,150 @@ async fn an_unexplained_429_keeps_the_generic_hint() {
     );
     assert!(!error.contains(secret), "{error}");
 }
+
+#[test]
+fn retry_after_accepts_delta_seconds_and_http_dates() {
+    // Reference times computed independently (Python calendar.timegm).
+    let rfc_example = 784_111_777; // Sun, 06 Nov 1994 08:49:37 GMT
+    assert_eq!(ai::retry_after_seconds("120", 0), Some(120));
+    assert_eq!(
+        ai::retry_after_seconds("Sun, 06 Nov 1994 08:49:37 GMT", rfc_example - 60),
+        Some(60)
+    );
+    assert_eq!(
+        ai::retry_after_seconds("Thu, 05 Nov 2026 13:00:00 GMT", 1_793_883_600 - 90),
+        Some(90)
+    );
+    assert_eq!(
+        ai::retry_after_seconds("Tue, 29 Feb 2028 00:00:00 GMT", 1_835_395_200 - 1),
+        Some(1),
+        "leap day"
+    );
+    assert_eq!(
+        ai::retry_after_seconds("Sun, 06 Nov 1994 08:49:37 GMT", rfc_example + 3_600),
+        Some(0),
+        "an elapsed date means retry now, never a negative delay"
+    );
+    for malformed in [
+        "Sunday, 06-Nov-94 08:49:37 GMT", // obsolete RFC 850 form
+        "Sun Nov  6 08:49:37 1994",       // obsolete asctime form
+        "Sun, 06 Nov 1994 25:00:00 GMT",
+        "Sun, 06 Foo 1994 08:49:37 GMT",
+        "Sun, 06 Nov 1994 08:49:37 UTC",
+        "-5",
+        "soon",
+    ] {
+        assert_eq!(ai::retry_after_seconds(malformed, 0), None, "{malformed}");
+    }
+}
+
+#[tokio::test]
+async fn a_future_http_date_reports_the_remaining_delay() {
+    let secret = "sk-test-sensitive-date-body";
+    let error = too_many_requests_error(
+        "Retry-After: Fri, 31 Dec 2100 23:59:59 GMT\r\n",
+        &json!({"error": {"message": secret, "code": "rate_limit_exceeded"}}).to_string(),
+    )
+    .await;
+    let seconds: u64 = error
+        .split("retry after ")
+        .nth(1)
+        .and_then(|rest| rest.split(" s").next())
+        .and_then(|number| number.parse().ok())
+        .unwrap_or_else(|| panic!("no retry delay in: {error}"));
+    assert!(seconds > 365 * 24 * 3_600, "{error}");
+    assert!(!error.contains(secret), "{error}");
+}
+
+#[tokio::test]
+async fn an_elapsed_http_date_reports_no_remaining_delay() {
+    let secret = "sk-test-sensitive-elapsed-body";
+    let error = too_many_requests_error(
+        "Retry-After: Thu, 01 Jan 1970 00:00:10 GMT\r\n",
+        &json!({"error": {"message": secret, "code": "rate_limit_exceeded"}}).to_string(),
+    )
+    .await;
+    assert!(
+        error.contains("temporary rate limit; retry after 0 s"),
+        "{error}"
+    );
+    assert!(!error.contains(secret), "{error}");
+}
+
+#[test]
+fn a_failed_summary_is_persisted_for_status_and_cleared_by_the_next_success() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let mesh = |args: &[&str]| {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_dispatch-mesh"))
+            .arg("--workspace")
+            .arg(&root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    let use_provider = |base_url: String| {
+        let mut workspace = Workspace::open(&root).unwrap();
+        workspace.config.provider = Some(ProviderConfig {
+            base_url,
+            model: "test".into(),
+            api_key_env: None,
+            json_mode: false,
+            send_text: true,
+        });
+        workspace.save_config().unwrap();
+    };
+    drop(
+        Workspace::init(
+            &root,
+            Identity {
+                name: "Alice".into(),
+                email: "alice@example.test".into(),
+            },
+            None,
+            "main".into(),
+        )
+        .unwrap(),
+    );
+
+    // 1. The provider refuses the request: publication continues with the
+    //    factual fallback, and the sanitized failure survives into `status`.
+    let secret = "sk-test-sensitive-summary-body";
+    let (url, receiver, thread) =
+        serve_response(401, &json!({"error": {"message": secret}}).to_string());
+    use_provider(url);
+    std::fs::write(root.join("first.md"), "first").unwrap();
+    mesh(&["session", "finish"]);
+    mesh(&["sync"]);
+    let _ = receiver.recv().unwrap();
+    thread.join().unwrap();
+    let status: Value = serde_json::from_slice(&mesh(&["status"])).unwrap();
+    assert_eq!(status["status"], "needs_attention", "{status:#}");
+    let reason = status["reason"].as_str().unwrap();
+    assert!(
+        reason.starts_with("AI summary failed:") && reason.contains("HTTP 401"),
+        "{reason}"
+    );
+    assert!(!status.to_string().contains(secret), "{status:#}");
+    assert_eq!(status["summary_failure"], status["reason"]);
+    assert_eq!(status["sessions"][0]["stage"], "published", "{status:#}");
+
+    // 2. A later successful summary clears it.
+    let (url, receiver, thread) =
+        serve(r#"{"title":"Add second note","description":"Adds second.md."}"#);
+    use_provider(url);
+    std::fs::write(root.join("second.md"), "second").unwrap();
+    mesh(&["session", "finish"]);
+    mesh(&["sync"]);
+    let _ = receiver.recv().unwrap();
+    thread.join().unwrap();
+    let status: Value = serde_json::from_slice(&mesh(&["status"])).unwrap();
+    assert_eq!(status["status"], "synced", "{status:#}");
+    assert!(status["summary_failure"].is_null() && status["reason"].is_null());
+}

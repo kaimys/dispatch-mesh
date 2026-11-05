@@ -486,6 +486,31 @@ fn identical_concurrent_changes_do_not_add_an_empty_session_commit() {
     assert_eq!(bob.state.main, main);
     assert!(bob.state.manifest.sessions[&bob_id].discarded);
     assert!(!bob.state.manifest.sessions[&bob_id].changes.is_empty());
+
+    // The status model reports the discarded session as such, before and after
+    // a restart, and a discarded session leaves nothing waiting.
+    let assert_discarded = |workspace: &Workspace| {
+        let snapshot = workspace.status_snapshot();
+        let session = snapshot.sessions.iter().find(|s| s.id == bob_id).unwrap();
+        assert_eq!(session.stage, dispatch_mesh::status::Stage::Discarded);
+        assert_eq!(snapshot.status, dispatch_mesh::status::Summary::Synced);
+        let json = serde_json::to_value(&snapshot).unwrap();
+        let entry = json["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == bob_id.as_str())
+            .unwrap();
+        assert_eq!(entry["stage"], "discarded");
+        assert_eq!(json["status"], "synced");
+    };
+    assert_discarded(&bob);
+    let root = bob.root.clone();
+    drop(bob);
+    let bob = Workspace::open(&root).unwrap();
+    assert_discarded(&bob);
+    assert!(!bob.state.manifest.sessions[&bob_id].changes.is_empty());
+    assert_eq!(bob.state.main, main, "no empty commit after restart either");
 }
 
 fn origin_messages(origin: &Path) -> String {
@@ -796,4 +821,97 @@ fn unclassified_sync_failures_and_ai_failures_need_attention_with_a_reason() {
         snapshot.reason.as_deref(),
         Some("AI summary failed: Provider returned HTTP 401")
     );
+}
+
+#[test]
+fn a_failed_sync_records_its_cause_even_when_another_operation_holds_the_lock() {
+    use std::{
+        net::TcpListener,
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+    let temp = TempDir::new().unwrap();
+    // A loopback remote that accepts, stalls, and hangs up without answering.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/repo.git", listener.local_addr().unwrap());
+    let (network_started, network_signal) = mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let _ = network_started.send(());
+            std::thread::sleep(Duration::from_secs(1));
+            drop(stream);
+        }
+    });
+    let mut alice = init(&temp.path().join("alice"), "Alice", None);
+    // Test-only HTTP transport to the loopback fake remote, as in tests/cli.rs.
+    alice.config.remote = Some("test-remote".into());
+    alice.save_config().unwrap();
+    alice
+        .git
+        .run(&["config", "remote.origin.url", &url], None)
+        .unwrap();
+    fs::write(alice.root.join("note.md"), "saved before the failing sync").unwrap();
+    let root = alice.root.clone();
+    drop(alice);
+
+    // A competing operation takes the lock while the sync waits on the network
+    // and keeps it past network_call's 5 s re-acquire window.
+    let holder_root = root.clone();
+    let holder = std::thread::spawn(move || {
+        network_signal.recv().unwrap();
+        let started = Instant::now();
+        let workspace = loop {
+            match Workspace::open(&holder_root) {
+                Ok(workspace) => break workspace,
+                Err(_) if started.elapsed() < Duration::from_secs(10) => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(error) => panic!("competing operation never got the lock: {error:#}"),
+            }
+        };
+        std::thread::sleep(Duration::from_secs(7));
+        drop(workspace);
+    });
+    let error = Workspace::sync_and_record(&root).unwrap_err();
+    holder.join().unwrap();
+    assert!(
+        !error.is::<dispatch_mesh::engine::WorkspaceBusy>(),
+        "lock contention must not replace the sync's own failure: {error:#}"
+    );
+
+    let alice = Workspace::open(&root).unwrap();
+    let snapshot = alice.status_snapshot();
+    assert_eq!(
+        snapshot.status,
+        dispatch_mesh::status::Summary::NeedsAttention
+    );
+    assert!(
+        snapshot
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("Synchronization waiting: ")),
+        "the cause must be durable: {snapshot:?}"
+    );
+    assert_eq!(
+        alice.state.observed["note.md"],
+        b"saved before the failing sync"
+    );
+    drop(alice);
+
+    // The next successful sync clears the recorded failure.
+    let origin = temp.path().join("origin.git");
+    remote(&origin);
+    let alice = Workspace::open(&root).unwrap();
+    alice
+        .git
+        .run(
+            &["config", "remote.origin.url", &origin.to_string_lossy()],
+            None,
+        )
+        .unwrap();
+    drop(alice);
+    Workspace::sync_and_record(&root).unwrap();
+    let alice = Workspace::open(&root).unwrap();
+    assert!(alice.state.attention.is_none() && alice.state.offline.is_none());
+    assert!(alice.status_snapshot().reason.is_none());
 }
