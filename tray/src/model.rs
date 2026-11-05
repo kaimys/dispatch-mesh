@@ -198,7 +198,8 @@ fn fit(prefix: &str, text: &str) -> String {
 }
 
 /// The tray tooltip, also the icon's accessible name. It always keeps
-/// `Dispatch Mesh — <state>`; a long summary goes first, then the reason.
+/// `Dispatch Mesh — <state>` and adds the reason for attention and offline;
+/// when too long, the summary of other workspaces goes first, then the reason.
 pub fn tooltip(workspaces: &[Workspace]) -> String {
     if workspaces.is_empty() {
         return format!("{PRODUCT} — No workspace yet");
@@ -211,29 +212,32 @@ pub fn tooltip(workspaces: &[Workspace]) -> String {
         return format!("{PRODUCT} — Needs attention: Mesh isn't syncing any workspace here");
     };
     let head = format!("{PRODUCT} — {}", first.short_label());
-    let attention = first.icon() == Some(Icon::Attention);
+    // Attention and offline always say why (ADR-0010 supplies a reason).
+    let explained = matches!(first.icon(), Some(Icon::Attention | Icon::Offline));
     if counted.len() == 1 && workspaces.len() == 1 {
-        return match (attention, first.reason()) {
+        return match (explained, first.reason()) {
             (true, Some(reason)) => fit(&format!("{head}: "), reason),
             _ => head,
         };
     }
     let rest = &counted[1..];
-    if rest.iter().all(|w| w.icon() == first.icon())
-        && matches!(first.icon(), Some(Icon::UpToDate | Icon::Offline))
-    {
+    if rest.iter().all(|w| w.icon() == first.icon()) && first.icon() == Some(Icon::UpToDate) {
         return format!(
             "{head} ({})",
             plural(counted.len(), "workspace", "workspaces")
         );
     }
-    let subject = match (attention, first.reason()) {
+    let subject = match (explained, first.reason()) {
         (true, Some(reason)) => format!("{}, {reason}", first.name),
         _ => first.name.clone(),
     };
     let more_attention = rest
         .iter()
         .filter(|w| w.icon() == Some(Icon::Attention))
+        .count();
+    let more_offline = rest
+        .iter()
+        .filter(|w| w.icon() == Some(Icon::Offline))
         .count();
     let others = if rest.is_empty() {
         None
@@ -246,6 +250,8 @@ pub fn tooltip(workspaces: &[Workspace]) -> String {
                 "need attention"
             }
         ))
+    } else if more_offline > 0 {
+        Some(format!("{more_offline} more offline"))
     } else if rest.iter().all(|w| w.icon() == Some(Icon::UpToDate)) {
         Some(format!(
             "{} up to date",
@@ -453,7 +459,7 @@ mod tests {
                 Summary::Offline,
                 Some("Could not reach the remote (connection timed out)")
             ),
-            "Dispatch Mesh — Offline, changes saved on this device"
+            "Dispatch Mesh — Offline, changes saved on this device: Could not reach the remote (connection timed out)"
         );
         assert_eq!(
             one(Summary::NeedsAttention, Some("2 unresolved conflicts")),
@@ -482,7 +488,27 @@ mod tests {
         let offline = |id, name| running(id, name, Summary::Offline, Some("timeout"));
         assert_eq!(
             tooltip(&[offline(0, "A"), offline(1, "B")]),
-            "Dispatch Mesh — Offline, changes saved on this device (2 workspaces)"
+            "Dispatch Mesh — Offline, changes saved on this device: A, timeout · 1 more offline"
+        );
+        let wiki_offline = running(
+            0,
+            "Team Wiki",
+            Summary::Offline,
+            Some("Could not reach the remote"),
+        );
+        assert_eq!(
+            tooltip(&[handbook.clone(), wiki_offline.clone()]),
+            "Dispatch Mesh — Offline, changes saved on this device: Team Wiki, Could not reach the remote · 1 other up to date"
+        );
+        let conflict = running(
+            1,
+            "Notes",
+            Summary::NeedsAttention,
+            Some("1 unresolved conflict"),
+        );
+        assert_eq!(
+            tooltip(&[wiki_offline, conflict]),
+            "Dispatch Mesh — Needs attention: Notes, 1 unresolved conflict · 1 more offline"
         );
         let synced = |id, name| running(id, name, Summary::Synced, None);
         assert_eq!(
@@ -499,6 +525,19 @@ mod tests {
 
     #[test]
     fn long_tooltips_keep_the_state_and_stay_within_the_windows_limit() {
+        let offline_reason =
+            "Could not reach the remote ".to_owned() + &"(very long cause) ".repeat(10);
+        let offline = running(0, "Team Wiki", Summary::Offline, Some(&offline_reason));
+        let text = tooltip(&[offline, running(1, "Other", Summary::Synced, None)]);
+        assert!(text.encode_utf16().count() <= TOOLTIP_LIMIT, "{text}");
+        assert!(
+            text.starts_with(
+                "Dispatch Mesh — Offline, changes saved on this device: Team Wiki, Could not reach"
+            ),
+            "{text}"
+        );
+        assert!(text.ends_with('…') && !text.contains(" · "), "{text}");
+
         let reason = "Local capture waiting: ".to_owned() + &"verylongfolder/".repeat(20);
         let wiki = running(0, "Team Wiki", Summary::NeedsAttention, Some(&reason));
         let other = running(1, "Other", Summary::Synced, None);

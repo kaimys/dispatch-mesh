@@ -139,7 +139,7 @@ cargo build --release
 ```
 
 - Each `--workspace` must already be set up with `dispatch-mesh init`. Adding workspaces from the window comes with guided setup.
-- The icon shows the most urgent state of all workspaces: needs attention, offline, working (saved on this device, shared as draft, finishing up), or up to date. The tooltip names the state, and for attention the reason. State is told apart by the icon's badge shape, not by color alone.
+- The icon shows the most urgent state of all workspaces: needs attention, offline, working (saved on this device, shared as draft, finishing up), or up to date. The tooltip names the state, and for attention and offline the reason. State is told apart by the icon's badge shape, not by color alone.
 - Left-click opens the status window: each workspace's name, folder and state, with the reason for attention or offline. With several workspaces, it lists the most urgent first.
 - Closing the window only hides it; Mesh keeps syncing. **Quit** in the right-click menu captures saved changes and stops, without waiting for the network, just like Ctrl+C for `run`.
 - If a CLI `run` or another tray already runs a workspace, the window says so and offers **Retry**; the other workspaces keep running. CLI commands such as `status`, `sync`, `session finish` and `intent` keep working while the tray runs.
