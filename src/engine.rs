@@ -592,6 +592,7 @@ impl Workspace {
             self.push_manifest()?;
         }
         self.state.attention = None;
+        self.state.offline = None;
         self.save()
     }
 
@@ -684,6 +685,16 @@ impl Workspace {
     }
 
     fn push_manifest(&mut self) -> Result<()> {
+        // Revisions contained in this manifest; recorded only once the device
+        // branch on the remote is known to hold them.
+        let pushed: BTreeMap<String, u64> = self
+            .state
+            .manifest
+            .sessions
+            .values()
+            .filter(|s| s.device == self.config.device)
+            .map(|s| (s.id.clone(), s.revision))
+            .collect();
         let manifest = Manifest {
             version: 2,
             sessions: self
@@ -723,6 +734,7 @@ impl Workspace {
             .as_ref()
             == Some(&commit)
         {
+            self.record_uploaded(pushed);
             return Ok(());
         }
         self.network_call(|git| {
@@ -732,7 +744,58 @@ impl Workspace {
             )
         })?;
         self.git.run(&["update-ref", &remote_ref, &commit], None)?;
+        // network_call reloaded state from disk, so record after it returns.
+        self.record_uploaded(pushed);
         Ok(())
+    }
+
+    /// Remember which own revisions reached the remote device branch. This is
+    /// local-only state: it is never encoded into the manifest, so recording an
+    /// upload never changes what the next push would send.
+    fn record_uploaded(&mut self, pushed: BTreeMap<String, u64>) {
+        let sessions = &self.state.manifest.sessions;
+        self.state.uploaded = pushed
+            .into_iter()
+            .filter(|(id, _)| sessions.get(id).is_some_and(|s| !s.settled()))
+            .collect();
+    }
+
+    /// Open, sync, and on failure persist its cause for `status`. Shared by the
+    /// CLI `sync` command and the background runner.
+    pub fn sync_and_record(root: &Path) -> Result<()> {
+        let mut workspace = Workspace::open(root)?;
+        let result = workspace.sync();
+        drop(workspace);
+        if let Err(error) = &result
+            && !error.is::<WorkspaceBusy>()
+            && let Ok(mut workspace) = Workspace::open(root)
+        {
+            workspace.record_sync_failure(error);
+            workspace.save()?;
+        }
+        result
+    }
+
+    /// Record why a sync failed. An unreachable remote is `offline`; every other
+    /// failure, including unclassified ones, needs the user's attention (ADR-0010).
+    pub fn record_sync_failure(&mut self, error: &anyhow::Error) {
+        const SYNC_FAILURE: &str = "Synchronization waiting: ";
+        let message = format!("{error:#}");
+        if crate::git::failure_kind(error) == Some(crate::git::GitFailureKind::Offline) {
+            // Replace a previous sync failure, but keep engine-raised attention.
+            if self
+                .state
+                .attention
+                .as_deref()
+                .is_some_and(|text| text.starts_with(SYNC_FAILURE))
+            {
+                self.state.attention = None;
+            }
+            self.state.offline = Some(message);
+        } else {
+            self.state.offline = None;
+            self.state.attention = Some(format!("{SYNC_FAILURE}{message}"));
+        }
     }
 
     fn reconcile_published(&mut self) -> Result<()> {

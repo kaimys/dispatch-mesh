@@ -135,6 +135,50 @@ pub fn chat_completions_url(config: &ProviderConfig) -> Result<reqwest::Url> {
     Ok(url)
 }
 
+/// Tell exhausted quota apart from a temporary rate limit on HTTP 429, using
+/// only the provider's error code/type and `Retry-After`. The body is parsed
+/// for those two fields and never included in the message.
+async fn too_many_requests(mut response: reqwest::Response) -> String {
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_string());
+    let mut body = Vec::new();
+    while body.len() < 64 * 1024 {
+        match response.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            _ => break,
+        }
+    }
+    classify_too_many_requests(retry_after.as_deref(), &body)
+}
+
+pub fn classify_too_many_requests(retry_after: Option<&str>, body: &[u8]) -> String {
+    let error = serde_json::from_slice::<Value>(body).ok();
+    let field = |name: &str| {
+        error
+            .as_ref()
+            .and_then(|value| value["error"][name].as_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default()
+    };
+    let (code, kind) = (field("code"), field("type"));
+    let is = |pattern: &str| code.contains(pattern) || kind.contains(pattern);
+    if is("insufficient_quota") || is("quota_exceeded") || is("billing") {
+        return "Provider returned HTTP 429: provider quota or billing exhausted; check the provider account".to_string();
+    }
+    if is("rate_limit") || retry_after.is_some() {
+        return match retry_after.and_then(|value| value.parse::<u64>().ok()) {
+            Some(seconds) => {
+                format!("Provider returned HTTP 429: temporary rate limit; retry after {seconds} s")
+            }
+            None => "Provider returned HTTP 429: temporary rate limit; retry later".to_string(),
+        };
+    }
+    http_failure(reqwest::StatusCode::TOO_MANY_REQUESTS)
+}
+
 fn http_failure(status: reqwest::StatusCode) -> String {
     let hint = match status.as_u16() {
         400 => "check the model and supported request parameters",
@@ -225,9 +269,12 @@ impl Summarizer for ChatCompletions {
                         );
                         return Ok(message);
                     }
-                    Ok(response)
-                        if response.status().as_u16() == 429
-                            || response.status().is_server_error() => http_failure(response.status()),
+                    Ok(response) if response.status().as_u16() == 429 => {
+                        too_many_requests(response).await
+                    }
+                    Ok(response) if response.status().is_server_error() => {
+                        http_failure(response.status())
+                    }
                     Ok(response) => {
                         anyhow::bail!("{}", http_failure(response.status()))
                     }
@@ -248,13 +295,26 @@ impl Summarizer for ChatCompletions {
 }
 
 pub async fn generate(config: &Config, session: &Session) -> Message {
+    generate_with_failure(config, session).await.0
+}
+
+/// Like `generate`, but also returns the provider failure that forced the local
+/// fallback, so callers can persist it. The text never contains credentials or
+/// response bodies. Disabled text sharing and an unconfigured provider are not failures.
+pub async fn generate_with_failure(
+    config: &Config,
+    session: &Session,
+) -> (Message, Option<String>) {
     if let Some(provider) = &config.provider {
         // There is no evidence for a semantic summary without text. Derive file
         // operations locally instead of paying a model to infer them from sizes.
         if !provider.send_text {
-            return file_operations_message(
-                session,
-                "Text sharing is disabled. File operations summarized locally.",
+            return (
+                file_operations_message(
+                    session,
+                    "Text sharing is disabled. File operations summarized locally.",
+                ),
+                None,
             );
         }
         match (ChatCompletions {
@@ -263,11 +323,17 @@ pub async fn generate(config: &Config, session: &Session) -> Message {
         .summarize(session)
         .await
         {
-            Ok(message) => return with_recorded_intent(session, message),
-            Err(error) => eprintln!(
-                "AI summary failed: {error}; using a factual local message. No alternate provider was contacted."
-            ),
+            Ok(message) => return (with_recorded_intent(session, message), None),
+            Err(error) => {
+                eprintln!(
+                    "AI summary failed: {error}; using a factual local message. No alternate provider was contacted."
+                );
+                return (
+                    fallback(session),
+                    Some(format!("AI summary failed: {error}")),
+                );
+            }
         }
     }
-    fallback(session)
+    (fallback(session), None)
 }

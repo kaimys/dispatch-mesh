@@ -33,7 +33,22 @@ On GitHub, select `mesh/devices/<device-id>` and browse `drafts/<session-id>/fil
 
 Local state uses the same reference-based model with content-addressed SQLite BLOBs. Opening an existing workspace atomically migrates its version-one state and keeps the original JSON in a migration backup table. Session IDs, content fingerprints, and existing published commits remain unchanged. Version-one remote snapshots remain readable; new device snapshots use version two. Upgrade all collaborating clients before using version-two snapshots. Existing Git history is retained, including old snapshot commits; Mesh does not rewrite it to remove the earlier representation.
 
-`status` reads a committed SQLite snapshot without taking the operation lock, so it remains available during synchronization. It includes `capture_error`, `local_changes_waiting`, and `recovery_pending` diagnostics. Genuine run-loop errors report their cause and are rate-limited; brief internal lock contention is retried quietly without losing pending scans.
+`status` reads a committed SQLite snapshot without taking the operation lock, so it remains available during synchronization. Genuine run-loop errors report their cause and are rate-limited; brief internal lock contention is retried quietly without losing pending scans.
+
+The top-level `status` is one workspace summary. When several apply, the first in this order wins:
+
+| `status` | Meaning |
+|---|---|
+| `needs_attention` | Something needs you: an unresolved conflict, a capture error, a sync failure other than an unreachable remote (refused login or permission, rejected push, unexpected history, or any unclassified Git failure), an engine pause, or the last AI summary failing. |
+| `offline` | The last sync could not reach the remote (DNS, connection refused, timeout, TLS handshake). Local capture continues; the next successful sync clears it. |
+| `saved_locally` | Saved edits that are not yet uploaded as a draft. |
+| `draft_uploaded` | Your open session is on your device branch, so other clients can already see it. |
+| `waiting_for_finalization` | A closed session is waiting for summarization, conflict resolution, dependencies, or publication to `main`. |
+| `synced` | All your sessions are published or discarded and nothing is waiting. |
+
+For `needs_attention` and `offline`, `reason` names the cause; it never contains credentials, Git's raw error output, or provider response bodies. Each entry in `sessions` carries a `stage`: `saved_locally` → `draft_uploaded` → `waiting_for_finalization` → `published`, or `discarded`. Sessions received from other devices are uploaded by definition; a workspace without a remote has no upload stage. The raw `attention`, `offline`, `summary_failure`, `capture_error`, `local_changes_waiting`, and `recovery_pending` fields remain available. Earlier previews reported `waiting_to_sync`; that value no longer appears.
+
+Git always runs with `LC_ALL=C`, so failures are classified the same way on any system language. On an HTTP 429 from the AI provider, Mesh separates exhausted quota or billing from a temporary rate limit (including the provider's retry delay) when the provider says which it is.
 
 ## Agents and intent
 
@@ -83,6 +98,32 @@ The export directory must be new and outside the workspace. Records preserve exa
 Mesh persists local state transactionally in `.mesh/state.sqlite` and uses a write-ahead journal when applying incoming content. Do not delete `.mesh`: it holds drafts, pending edits, conflict inputs, and private Git objects. Displaced files remain in `.mesh/recovery/<id>/content` with a `record.json` identifying their original path; no automatic cleanup is performed in this preview. If local edits cannot be separated from received peer text, their bytes are saved in pending-capture state and synchronization pauses for attention. `session finish` checkpoints the current draft and captures those dependent edits into the next session. This conservative fallback avoids attributing another author's work to the local user.
 
 Conflict records retain the exact input revisions that contributed to the competing view. A recorded selection continues to govern those inputs if the clients publish in a different order; later, different edits are reconciled separately. A closed session with no effective changes after integration or resolution is marked discarded instead of adding an empty permanent commit. Its original snapshots, intent, and resolution records remain recoverable. Update collaborating clients together when adopting these workflow fixes.
+
+### Storage growth
+
+Nothing Mesh stores is pruned in this preview. Plan disk space accordingly.
+
+| Location | What accumulates |
+|---|---|
+| `.mesh/state.sqlite` | Local state, plus a content-addressed `blobs` table holding every captured version, conflict input, pending capture, and the original state of migrated workspaces. Identical content is stored once. |
+| `.mesh/objects.git` | Mesh's private Git store: every draft snapshot, device-branch commit, and published commit fetched or created on this device. |
+| `.mesh/recovery/<id>/` | Files displaced while applying incoming content. Each is kept indefinitely. |
+| Remote device branches `mesh/devices/<device-id>` | One commit per draft upload, with every referenced version kept reachable, including settled sessions and conflict inputs. |
+| Remote `main` | One immutable commit per finalized session. History is never rewritten. |
+
+### Recovery procedures
+
+Run `status` first; `reason` tells you which case applies. Never delete `.mesh` or reset Mesh's Git store to recover: both hold the only copies of drafts and conflict inputs.
+
+- **`offline`.** Nothing to do: keep working. Edits are captured locally and upload on the next successful sync. If it persists, check the network, proxy, and VPN, then run `sync`.
+- **`needs_attention`, "N unresolved conflicts".** Use `conflicts list`, `conflicts show` or `conflicts export`, then `conflicts resolve <id> --choose accepted|incoming`. Unrelated files keep syncing meanwhile.
+- **`needs_attention`, "Remote refused access".** Credentials or repository permissions are wrong. Fix the sign-in in Git Credential Manager or your SSH agent, confirm you can write the repository, then run `sync`.
+- **`needs_attention`, "Remote rejected the update".** Usually a publication race with another client. The next cycle fetches and retries; run `sync` if it does not clear.
+- **`needs_attention`, "Shared history was rewritten outside Mesh" or "The shared branch was deleted outside Mesh".** Someone changed `main` with Git directly. Mesh pauses synchronization and keeps local work. Restore the shared branch on the remote (it must contain the commits Mesh last saw), then run `sync`.
+- **`needs_attention`, "Local capture waiting: …".** A file could not be read or is unsupported (see *Preview boundaries*), for example a symlink, a case collision, or a path that became ignored after it was synchronized. Fix or restore the named file or ignore rule; no deletion is recorded meanwhile.
+- **`needs_attention`, pending-capture message ("Edits depend on a received draft …").** Run `session finish`. It checkpoints the current draft, and the dependent edits enter the next session.
+- **`needs_attention`, "AI summary failed: …".** Publication continues with a factual local message. Fix the API key, quota, or endpoint named in the message. The state clears with the next summary that does not fail, including one made after you remove the provider.
+- **Restoring a displaced file.** Open `.mesh/recovery/<id>/record.json` to find the original path, then copy `.mesh/recovery/<id>/content` back to that path (or anywhere else). The copy is an ordinary edit and enters a new session.
 
 ## Preview boundaries
 

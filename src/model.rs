@@ -15,7 +15,7 @@ pub fn digest(value: impl AsRef<[u8]>) -> String {
     format!("{:x}", Sha256::digest(value.as_ref()))
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Identity {
     pub name: String,
     pub email: String,
@@ -151,6 +151,16 @@ pub struct State<B = Vec<u8>> {
     pub pending_capture: Option<Files<B>>,
     #[serde(default)]
     pub apply_backups: BTreeMap<String, String>,
+    /// Own session id -> last revision pushed to the device branch. Local-only:
+    /// never part of the manifest, so recording a push cannot trigger another one.
+    #[serde(default)]
+    pub uploaded: BTreeMap<String, u64>,
+    /// Cause of the last sync failure when the remote was unreachable.
+    #[serde(default)]
+    pub offline: Option<String>,
+    /// Last AI-summary failure, already free of credentials and response bodies.
+    #[serde(default)]
+    pub summary_failure: Option<String>,
 }
 
 pub fn binary(content: &Option<Vec<u8>>) -> bool {

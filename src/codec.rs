@@ -111,6 +111,9 @@ impl<A> State<A> {
                 .map(|files| values(files, &mut *map))
                 .transpose()?,
             apply_backups: self.apply_backups,
+            uploaded: self.uploaded,
+            offline: self.offline,
+            summary_failure: self.summary_failure,
         })
     }
 }

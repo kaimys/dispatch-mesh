@@ -19,11 +19,38 @@ fn serve_response(
     status: u16,
     body: &str,
 ) -> (String, mpsc::Receiver<Value>, std::thread::JoinHandle<()>) {
+    serve_responses(status, "", body, 1)
+}
+
+/// Answer `connections` requests with the same response; `headers` are extra
+/// `Name: value\r\n` lines. A retried request needs more than one connection.
+fn serve_responses(
+    status: u16,
+    headers: &str,
+    body: &str,
+    connections: usize,
+) -> (String, mpsc::Receiver<Value>, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
     let body = body.to_string();
+    let extra = headers.to_string();
     let (sender, receiver) = mpsc::channel();
     let thread = std::thread::spawn(move || {
+        for _ in 0..connections {
+            respond(&listener, status, &extra, &body, &sender);
+        }
+    });
+    (url, receiver, thread)
+}
+
+fn respond(
+    listener: &TcpListener,
+    status: u16,
+    extra: &str,
+    body: &str,
+    sender: &mpsc::Sender<Value>,
+) {
+    {
         let (mut stream, _) = listener.accept().unwrap();
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -57,9 +84,8 @@ fn serve_response(
         sender
             .send(serde_json::from_slice(&request[header_end..header_end + length]).unwrap())
             .unwrap();
-        write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
-    });
-    (url, receiver, thread)
+        write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+    }
 }
 
 fn session() -> Session {
@@ -441,4 +467,67 @@ async fn invalid_message_errors_do_not_echo_model_output() {
     assert!(!format!("{error:#}").contains(secret));
     let _ = receiver.recv().unwrap();
     thread.join().unwrap();
+}
+
+async fn too_many_requests_error(headers: &str, body: &str) -> String {
+    // The provider retries once, so the mock answers both attempts identically.
+    let (url, receiver, thread) = serve_responses(429, headers, body, 2);
+    let provider = ChatCompletions {
+        config: ProviderConfig {
+            base_url: url,
+            model: "test".into(),
+            api_key_env: None,
+            json_mode: false,
+            send_text: false,
+        },
+    };
+    let error = provider.summarize(&session()).await.unwrap_err();
+    let _ = receiver.recv().unwrap();
+    thread.join().unwrap();
+    format!("{error:#}")
+}
+
+#[tokio::test]
+async fn exhausted_quota_is_distinguished_from_a_rate_limit_without_echoing_the_body() {
+    let secret = "sk-test-sensitive-quota-body";
+    let error = too_many_requests_error(
+        "",
+        &json!({"error": {"message": secret, "type": "insufficient_quota", "code": "insufficient_quota"}})
+            .to_string(),
+    )
+    .await;
+    assert!(error.contains("quota or billing exhausted"), "{error}");
+    assert!(!error.contains("rate limit"), "{error}");
+    assert!(!error.contains(secret), "{error}");
+}
+
+#[tokio::test]
+async fn a_rate_limit_reports_the_retry_delay_without_echoing_the_body() {
+    let secret = "sk-test-sensitive-rate-body";
+    let error = too_many_requests_error(
+        "Retry-After: 7\r\n",
+        &json!({"error": {"message": secret, "type": "requests", "code": "rate_limit_exceeded"}})
+            .to_string(),
+    )
+    .await;
+    assert!(
+        error.contains("temporary rate limit; retry after 7 s"),
+        "{error}"
+    );
+    assert!(!error.contains(secret), "{error}");
+}
+
+#[tokio::test]
+async fn an_unexplained_429_keeps_the_generic_hint() {
+    let secret = "sk-test-sensitive-plain-body";
+    let error = too_many_requests_error("", secret).await;
+    assert!(
+        error.contains("HTTP 429: check rate limits and available API quota"),
+        "{error}"
+    );
+    assert!(
+        !error.contains("quota or billing exhausted") && !error.contains("temporary rate limit"),
+        "{error}"
+    );
+    assert!(!error.contains(secret), "{error}");
 }

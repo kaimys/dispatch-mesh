@@ -359,3 +359,147 @@ fn slow_remote_does_not_block_capture_or_overwrite_concurrent_saved_state() {
     }
     drop(runner);
 }
+
+/// Run the binary with an isolated Git configuration, so no system or user
+/// credential helper (e.g. Git Credential Manager) answers an authentication
+/// challenge, plus any extra environment such as a non-English locale.
+fn mesh_isolated(
+    workspace: &std::path::Path,
+    git_config: &std::path::Path,
+    env: &[(&str, &str)],
+    args: &[&str],
+) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dispatch-mesh"));
+    command
+        .arg("--workspace")
+        .arg(workspace)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", git_config);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.output().unwrap()
+}
+
+/// An HTTP remote that refuses every request with 401, for as long as the test runs.
+fn unauthorized_remote() -> String {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/repo.git", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => request.extend_from_slice(&chunk[..count]),
+                }
+            }
+            let _ = stream.write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"mesh-test\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    url
+}
+
+/// A URL on which nothing listens: connecting is refused immediately.
+fn unreachable_remote() -> String {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    format!("http://127.0.0.1:{port}/repo.git")
+}
+
+/// Init a workspace on a loopback `remote`, save a file, sync (which must fail)
+/// and return `status`.
+fn status_after_failed_sync(remote: &str, env: &[(&str, &str)]) -> serde_json::Value {
+    use dispatch_mesh::model::Identity;
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("work");
+    let git_config = temp.path().join("empty.gitconfig");
+    fs::write(&git_config, "").unwrap();
+    let mut mesh = Workspace::init(
+        &workspace,
+        Identity {
+            name: "Alice".into(),
+            email: "alice@example.test".into(),
+        },
+        None,
+        "main".into(),
+    )
+    .unwrap();
+    // Test-only HTTP transport to a loopback fake remote, as in the slow-remote
+    // test: Mesh accepts only HTTPS, SSH and local remotes from users.
+    mesh.config.remote = Some("test-remote".into());
+    mesh.save_config().unwrap();
+    mesh.git
+        .run(&["config", "remote.origin.url", remote], None)
+        .unwrap();
+    drop(mesh);
+    fs::write(workspace.join("note.md"), "saved while the remote fails").unwrap();
+    let sync = mesh_isolated(&workspace, &git_config, env, &["sync"]);
+    assert!(!sync.status.success(), "sync must fail against {remote}");
+    let status = mesh_isolated(&workspace, &git_config, env, &["status"]);
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let state: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    // Capture continues regardless of how the remote failed.
+    assert!(
+        state["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["files"] == serde_json::json!(["note.md"])),
+        "{state:#}"
+    );
+    state
+}
+
+fn assert_offline(state: &serde_json::Value) {
+    assert_eq!(state["status"], "offline", "{state:#}");
+    assert!(state["attention"].is_null(), "{state:#}");
+    let reason = state["reason"].as_str().unwrap();
+    assert!(reason.contains("Remote unreachable"), "{reason}");
+}
+
+fn assert_access_needs_attention(state: &serde_json::Value) {
+    assert_eq!(state["status"], "needs_attention", "{state:#}");
+    assert!(state["offline"].is_null(), "{state:#}");
+    let reason = state["reason"].as_str().unwrap();
+    assert!(reason.contains("Remote refused access"), "{reason}");
+}
+
+const GERMAN: &[(&str, &str)] = &[
+    ("LANG", "de_DE.UTF-8"),
+    ("LC_ALL", "de_DE.UTF-8"),
+    ("LC_MESSAGES", "de_DE.UTF-8"),
+    ("LANGUAGE", "de"),
+];
+
+#[test]
+fn an_unreachable_remote_reports_offline_and_keeps_capturing() {
+    assert_offline(&status_after_failed_sync(&unreachable_remote(), &[]));
+}
+
+#[test]
+fn a_refused_login_needs_attention_instead_of_offline() {
+    assert_access_needs_attention(&status_after_failed_sync(&unauthorized_remote(), &[]));
+}
+
+#[test]
+fn failure_classification_does_not_depend_on_the_user_locale() {
+    assert_offline(&status_after_failed_sync(&unreachable_remote(), GERMAN));
+    assert_access_needs_attention(&status_after_failed_sync(&unauthorized_remote(), GERMAN));
+}

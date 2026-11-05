@@ -12,6 +12,106 @@ pub struct Git {
     pub dir: PathBuf,
 }
 
+/// Why a Git process failed, derived from its stderr without ever exposing that text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitFailureKind {
+    /// The remote could not be reached: DNS, connect, timeout, or TLS handshake.
+    Offline,
+    /// The remote refused the credentials or access to the repository.
+    Authentication,
+    /// The remote rejected the update, e.g. a non-fast-forward push.
+    Rejected,
+    /// Anything else, including failures that do not match a known pattern.
+    Other,
+}
+
+#[derive(Debug)]
+pub struct GitFailure {
+    pub kind: GitFailureKind,
+    pub exit: Option<i32>,
+}
+
+impl std::fmt::Display for GitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let exit = self.exit.unwrap_or(-1);
+        match self.kind {
+            GitFailureKind::Offline => write!(
+                f,
+                "Remote unreachable (exit {exit}). Check the network connection; local snapshots are retained and Mesh retries automatically"
+            ),
+            GitFailureKind::Authentication => write!(
+                f,
+                "Remote refused access (exit {exit}). Check repository permissions and sign-in; local snapshots are retained"
+            ),
+            GitFailureKind::Rejected => write!(
+                f,
+                "Remote rejected the update (exit {exit}). Mesh fetches and retries; local snapshots are retained"
+            ),
+            GitFailureKind::Other => write!(
+                f,
+                "Git operation failed (exit {exit}). Check repository access and connectivity; local snapshots are retained"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GitFailure {}
+
+/// The Git failure kind anywhere in an error's chain, if Git caused it.
+pub fn failure_kind(error: &anyhow::Error) -> Option<GitFailureKind> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<GitFailure>())
+        .map(|failure| failure.kind)
+}
+
+/// Classify untranslated (`LC_ALL=C`) Git stderr. Access problems are checked
+/// before connectivity because their messages also mention the remote URL.
+pub fn classify_stderr(stderr: &str) -> GitFailureKind {
+    let text = stderr.to_ascii_lowercase();
+    let any = |patterns: &[&str]| patterns.iter().any(|p| text.contains(p));
+    if any(&[
+        "authentication failed",
+        "could not read username",
+        "could not read password",
+        "permission denied (publickey",
+        "returned error: 401",
+        "returned error: 403",
+        "repository not found",
+        "access denied",
+        "invalid username or password",
+    ]) {
+        GitFailureKind::Authentication
+    } else if any(&[
+        "[rejected]",
+        "[remote rejected]",
+        "non-fast-forward",
+        "fetch first",
+        "failed to push some refs",
+    ]) {
+        GitFailureKind::Rejected
+    } else if any(&[
+        "could not resolve host",
+        "could not resolve hostname",
+        "failed to connect to",
+        "connection refused",
+        "connection timed out",
+        "operation timed out",
+        "timed out after",
+        "network is unreachable",
+        "no route to host",
+        "connection reset",
+        "ssl connect error",
+        "tls handshake",
+        "handshake failed",
+        "gnutls_handshake",
+    ]) {
+        GitFailureKind::Offline
+    } else {
+        GitFailureKind::Other
+    }
+}
+
 impl Git {
     pub fn command(&self) -> Command {
         let mut cmd = Command::new("git");
@@ -19,7 +119,10 @@ impl Git {
             .arg("--git-dir")
             .arg(&self.dir)
             .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GCM_INTERACTIVE", "never");
+            .env("GCM_INTERACTIVE", "never")
+            // Untranslated messages keep failure classification locale-independent.
+            .env("LC_ALL", "C")
+            .env_remove("LANGUAGE");
         // Keep inherited Git environment from redirecting this private repository.
         for key in [
             "GIT_WORK_TREE",
@@ -51,6 +154,9 @@ impl Git {
         use std::io::{Read, Seek};
         source.write_all(input.unwrap_or_default())?;
         source.rewind()?;
+        let network = command
+            .get_args()
+            .any(|arg| arg == "fetch" || arg == "push" || arg == "ls-remote");
         let mut child = command
             .stdin(Stdio::from(source))
             .stdout(output.try_clone()?)
@@ -65,6 +171,13 @@ impl Git {
             if start.elapsed() > Duration::from_secs(30) {
                 let _ = child.kill();
                 let _ = child.wait();
+                if network {
+                    return Err(GitFailure {
+                        kind: GitFailureKind::Offline,
+                        exit: None,
+                    }
+                    .into());
+                }
                 bail!("Git operation timed out; local snapshots are retained");
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -79,10 +192,16 @@ impl Git {
         );
         if !status.success() {
             // Do not echo Git stderr: a server or credential helper may include secrets.
-            bail!(
-                "Git operation failed (exit {}). Check repository access and connectivity; local snapshots are retained",
-                status.code().unwrap_or(-1)
-            );
+            // It is read only to classify the failure, and never leaves this function.
+            let mut errors = errors;
+            let mut stderr = Vec::new();
+            errors.rewind()?;
+            errors.take(64 * 1024).read_to_end(&mut stderr)?;
+            return Err(GitFailure {
+                kind: classify_stderr(&String::from_utf8_lossy(&stderr)),
+                exit: status.code(),
+            }
+            .into());
         }
         Ok(bytes)
     }
@@ -300,4 +419,89 @@ pub fn validate_path(path: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_git_process_runs_with_untranslated_messages() {
+        let git = Git {
+            dir: PathBuf::from("unused"),
+        };
+        let command = git.command();
+        let envs: BTreeMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("LC_ALL")),
+            Some(&Some(std::ffi::OsStr::new("C")))
+        );
+        assert_eq!(envs.get(std::ffi::OsStr::new("LANGUAGE")), Some(&None));
+    }
+
+    #[test]
+    fn connection_failures_are_offline() {
+        for stderr in [
+            "fatal: unable to access 'https://github.com/a/b.git/': Could not resolve host: github.com",
+            "fatal: unable to access 'https://127.0.0.1:9/x.git/': Failed to connect to 127.0.0.1 port 9 after 2040 ms: Connection refused",
+            "fatal: unable to access 'https://example.com/x.git/': Failed to connect to example.com port 443 after 21000 ms: Timed out",
+            "fatal: unable to access 'https://example.com/x.git/': OpenSSL SSL_connect: SSL_ERROR_SYSCALL in connection to example.com:443 SSL connect error",
+            "fatal: unable to access 'https://example.com/x.git/': schannel: failed to receive handshake, SSL/TLS connection failed; TLS handshake failed",
+            "ssh: Could not resolve hostname github.com: Name or service not known\r\nfatal: Could not read from remote repository.",
+            "fatal: unable to access 'https://example.com/x.git/': gnutls_handshake() failed: The TLS connection was non-properly terminated.",
+            "fatal: unable to access 'https://example.com/x.git/': Network is unreachable",
+        ] {
+            assert_eq!(classify_stderr(stderr), GitFailureKind::Offline, "{stderr}");
+        }
+    }
+
+    #[test]
+    fn access_failures_need_attention_not_offline() {
+        for stderr in [
+            "remote: Invalid username or token.\nfatal: Authentication failed for 'https://github.com/a/b.git/'",
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+            "fatal: unable to access 'https://example.com/x.git/': The requested URL returned error: 403",
+            "fatal: unable to access 'https://127.0.0.1:8080/x.git/': The requested URL returned error: 401",
+            "git@github.com: Permission denied (publickey).\r\nfatal: Could not read from remote repository.",
+            "remote: Repository not found.\nfatal: repository 'https://github.com/a/missing.git/' not found",
+        ] {
+            assert_eq!(
+                classify_stderr(stderr),
+                GitFailureKind::Authentication,
+                "{stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_pushes_and_unknown_failures_are_not_offline() {
+        assert_eq!(
+            classify_stderr(
+                "To https://example.com/x.git\n ! [rejected]        abc -> main (non-fast-forward)\nerror: failed to push some refs to 'https://example.com/x.git'"
+            ),
+            GitFailureKind::Rejected
+        );
+        for stderr in [
+            "fatal: '/tmp/missing.git' does not appear to be a git repository\nfatal: Could not read from remote repository.",
+            "fatal: bad object deadbeef",
+            "",
+        ] {
+            assert_eq!(classify_stderr(stderr), GitFailureKind::Other, "{stderr}");
+        }
+    }
+
+    #[test]
+    fn failure_messages_never_contain_stderr() {
+        let failure = GitFailure {
+            kind: GitFailureKind::Authentication,
+            exit: Some(128),
+        };
+        let error = anyhow::Error::from(failure).context("Git push");
+        assert_eq!(failure_kind(&error), Some(GitFailureKind::Authentication));
+        let text = format!("{error:#}");
+        assert!(
+            !text.contains("token") && !text.contains("https://"),
+            "{text}"
+        );
+    }
 }

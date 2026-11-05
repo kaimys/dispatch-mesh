@@ -148,12 +148,11 @@ async fn execute(cli: Cli) -> Result<()> {
     let mut workspace = Workspace::open(&cli.workspace)?;
     match cli.command {
         Command::Sync => {
-            workspace.sync()?;
             drop(workspace);
+            Workspace::sync_and_record(&cli.workspace)?;
             summarize_ready(&cli.workspace).await?;
-            let mut workspace = Workspace::open(&cli.workspace)?;
-            workspace.sync()?;
-            show_status(&workspace)?;
+            Workspace::sync_and_record(&cli.workspace)?;
+            show_status(&Workspace::open(&cli.workspace)?)?;
         }
         Command::Status => show_status(&workspace)?,
         Command::Session { command: SessionCommand::Finish } => {
@@ -218,42 +217,9 @@ fn conflict_details(conflict: &Conflict) -> serde_json::Value {
 }
 
 fn show_status(workspace: &Workspace) -> Result<()> {
-    let scan = workspace.scan();
-    let capture_error = scan.as_ref().err().map(|error| format!("{error:#}"));
-    let local_changes_waiting = scan
-        .as_ref()
-        .is_ok_and(|files| files != &workspace.state.observed);
-    let timestamp = now();
-    let presence: Vec<_> = workspace.state.manifest.sessions.values().filter(|s| !s.closed && !s.settled()).flat_map(|s| s.changes.iter().map(move |(path, change)| (s, path, change)))
-        .filter(|(_, _, change)| timestamp.saturating_sub(change.last_edit) < 300)
-        .map(|(s, path, change)| json!({"path": path, "author": s.author, "device": s.device, "last_saved": change.last_edit, "signal": "recent_save"})).collect();
-    let status = if workspace.state.attention.is_some()
-        || capture_error.is_some()
-        || workspace.unresolved().next().is_some()
-    {
-        "needs_attention"
-    } else if local_changes_waiting
-        || workspace
-            .state
-            .manifest
-            .sessions
-            .values()
-            .any(|s| s.device == workspace.config.device && !s.settled())
-    {
-        "waiting_to_sync"
-    } else {
-        "synced"
-    };
     println!(
         "{}",
-        serde_json::to_string_pretty(
-            &json!({"status": status, "device": workspace.config.device, "main": workspace.state.main,
-                    "commit_message_mode": match &workspace.config.provider { None => "local_fallback", Some(provider) if provider.send_text => "ai_with_text", Some(_) => "local_metadata" },
-                    "attention": workspace.state.attention, "capture_error": capture_error, "local_changes_waiting": local_changes_waiting, "recovery_pending": workspace.state.applying.is_some(), "active_session": workspace.active_session().map(|s| &s.id),
-            "sessions": workspace.state.manifest.sessions.values().map(|s| json!({"id": s.id, "author": s.author, "closed": s.closed, "published": s.published, "discarded": s.discarded, "files": s.changes.keys().collect::<Vec<_>>(), "dependencies": s.dependencies})).collect::<Vec<_>>(),
-                    "unresolved_conflicts": workspace.unresolved().map(|c| json!({"id": c.id, "path": c.path, "binary": c.binary})).collect::<Vec<_>>(), "presence": presence
-                })
-        )?
+        serde_json::to_string_pretty(&workspace.status_snapshot())?
     );
     Ok(())
 }
@@ -278,8 +244,13 @@ async fn summarize_ready(root: &std::path::Path) -> Result<()> {
     }
     drop(workspace);
     for (session, hash) in sessions {
-        let message = ai::generate(&config, &session).await;
+        let (message, failure) = ai::generate_with_failure(&config, &session).await;
         let mut workspace = Workspace::open(root)?;
+        // Persist the latest provider outcome so `status` can explain it (ADR-0010).
+        if workspace.state.summary_failure != failure {
+            workspace.state.summary_failure = failure;
+            workspace.save()?;
+        }
         if let Some(current) = workspace.state.manifest.sessions.get_mut(&session.id)
             && current.snapshot_hash() == hash
             && current.closed
@@ -409,15 +380,7 @@ async fn watch(root: PathBuf) -> Result<()> {
                 if synchronization.is_none() && candidate.is_none() && !pending_scan && std::time::Instant::now() >= next_sync {
                     let sync_root = root.clone();
                     synchronization = Some(tokio::task::spawn_blocking(move || -> Result<()> {
-                        let mut workspace = Workspace::open(&sync_root)?;
-                        let result = workspace.sync();
-                        drop(workspace);
-                        if let Err(error) = &result && !error.is::<WorkspaceBusy>()
-                            && let Ok(mut workspace) = Workspace::open(&sync_root) {
-                            workspace.state.attention = Some(format!("Synchronization waiting: {error:#}"));
-                            workspace.save()?;
-                        }
-                        result
+                        Workspace::sync_and_record(&sync_root)
                     }));
                 }
                 if summary.is_none() && needs_summary {
