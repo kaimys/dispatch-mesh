@@ -208,6 +208,12 @@ const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
+enum Year {
+    Full(i64),
+    /// RFC 850's two-digit year; its century depends on the whole timestamp.
+    TwoDigit(i64),
+}
+
 /// Parse an HTTP-date into Unix seconds:
 /// - IMF-fixdate `Sun, 06 Nov 1994 08:49:37 GMT` (preferred),
 /// - RFC 850     `Sunday, 06-Nov-94 08:49:37 GMT` (obsolete, two-digit year),
@@ -226,7 +232,7 @@ fn http_date_unix(value: &str, now_unix: u64) -> Option<u64> {
     let parts: Vec<_> = value.split_ascii_whitespace().collect();
     let (year, month, day, time) = match parts.as_slice() {
         [weekday, day, month, year, time, "GMT"] if comma_day(weekday, &SHORT_DAYS) => (
-            digits(year, 4, 4)?,
+            Year::Full(digits(year, 4, 4)?),
             month_number(month)?,
             digits(day, 2, 2)?,
             *time,
@@ -235,11 +241,12 @@ fn http_date_unix(value: &str, now_unix: u64) -> Option<u64> {
             let [day, month, year] = date.split('-').collect::<Vec<_>>()[..] else {
                 return None;
             };
-            let year = full_year(digits(year, 2, 2)?, now_unix);
+            // The century depends on the complete timestamp; decided below.
+            let year = Year::TwoDigit(digits(year, 2, 2)?);
             (year, month_number(month)?, digits(day, 2, 2)?, *time)
         }
         [weekday, month, day, time, year] if SHORT_DAYS.contains(weekday) => (
-            digits(year, 4, 4)?,
+            Year::Full(digits(year, 4, 4)?),
             month_number(month)?,
             digits(day, 1, 2)?,
             *time,
@@ -252,33 +259,60 @@ fn http_date_unix(value: &str, now_unix: u64) -> Option<u64> {
         digits(clock.next()?, 2, 2)?,
         digits(clock.next()?, 2, 2)?,
     );
-    // Reject impossible dates instead of normalizing e.g. 31 Feb into March.
-    if clock.next().is_some()
-        || !(1..=days_in_month(year, month)).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
+    if clock.next().is_some() || hour > 23 || minute > 59 || second > 60 {
         return None;
     }
-    let seconds = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second;
-    u64::try_from(seconds).ok()
+    let time_of_day = hour * 3_600 + minute * 60 + second;
+    let year = match year {
+        Year::Full(year) => year,
+        Year::TwoDigit(two_digits) => rfc850_year(two_digits, month, day, time_of_day, now_unix),
+    };
+    // Reject impossible dates in the final interpretation instead of
+    // normalizing e.g. 31 Feb into March.
+    if !(1..=days_in_month(year, month)).contains(&day) {
+        return None;
+    }
+    u64::try_from(days_from_civil(year, month, day) * 86_400 + time_of_day).ok()
 }
 
-/// RFC 9110 §5.6.7: a two-digit year that appears more than 50 years in the
-/// future is the most recent past year with the same last two digits.
-fn full_year(two_digits: i64, now_unix: u64) -> i64 {
-    let now_days = (now_unix / 86_400) as i64;
-    let mut current = 1970 + now_days / 366;
-    while days_from_civil(current + 1, 1, 1) <= now_days {
-        current += 1;
-    }
-    let candidate = current - current.rem_euclid(100) + two_digits;
-    if candidate > current + 50 {
+/// RFC 9110 §5.6.7: an RFC 850 timestamp that appears to be more than 50
+/// years in the future is in the most recent past year with the same last two
+/// digits. The cutoff is the complete timestamp exactly 50 calendar years after
+/// now, not just its year: a timestamp exactly at the cutoff stays in the
+/// future, one second later it moves back a century.
+fn rfc850_year(two_digits: i64, month: i64, day: i64, time_of_day: i64, now_unix: u64) -> i64 {
+    let now = now_unix as i64;
+    let (now_year, now_month, now_day) = civil_from_days(now.div_euclid(86_400));
+    let cutoff =
+        days_from_civil(now_year + 50, now_month, now_day) * 86_400 + now.rem_euclid(86_400);
+    let candidate = now_year - now_year.rem_euclid(100) + two_digits;
+    // An impossible day only normalizes here for the comparison; the caller
+    // validates the final interpretation.
+    let timestamp = days_from_civil(candidate, month, day) * 86_400 + time_of_day;
+    if timestamp > cutoff {
         candidate - 100
     } else {
         candidate
     }
+}
+
+/// Calendar date for days since 1970-01-01 (H. Hinnant), inverse of `days_from_civil`.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month, day)
 }
 
 fn days_in_month(year: i64, month: i64) -> i64 {

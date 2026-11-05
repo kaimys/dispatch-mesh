@@ -590,6 +590,39 @@ fn retry_after_accepts_delta_seconds_and_http_dates() {
         Some(0),
         "2080 is more than 50 years ahead, so it means 1980 (elapsed)"
     );
+    // The cutoff is the complete timestamp 50 calendar years after now
+    // (2076-11-05T13:00:00Z = 3_371_806_800), not merely the year 2076.
+    assert_eq!(
+        ai::retry_after_seconds("Thursday, 05-Nov-76 12:59:59 GMT", now_2026),
+        Some(3_371_806_799 - now_2026),
+        "one second before the cutoff is still in the future"
+    );
+    assert_eq!(
+        ai::retry_after_seconds("Thursday, 05-Nov-76 13:00:00 GMT", now_2026),
+        Some(3_371_806_800 - now_2026),
+        "exactly 50 years ahead is not more than 50 years ahead"
+    );
+    assert_eq!(
+        ai::retry_after_seconds("Friday, 05-Nov-76 13:00:01 GMT", now_2026),
+        Some(0),
+        "one second past the cutoff means 1976, already elapsed"
+    );
+    assert_eq!(
+        ai::retry_after_seconds("Friday, 31-Dec-76 23:59:59 GMT", now_2026),
+        Some(0),
+        "a later date in the boundary year also means 1976"
+    );
+    // On a leap day, the 50th anniversary (2078-02-29) does not exist; the
+    // cutoff falls on the following instant, 2078-03-01T00:00:00Z.
+    let leap_day_2028 = 1_835_395_200;
+    assert_eq!(
+        ai::retry_after_seconds("Tuesday, 01-Mar-78 00:00:00 GMT", leap_day_2028),
+        Some(3_413_318_400 - leap_day_2028)
+    );
+    assert_eq!(
+        ai::retry_after_seconds("Wednesday, 01-Mar-78 00:00:01 GMT", leap_day_2028),
+        Some(0)
+    );
     assert_eq!(
         ai::retry_after_seconds("Tue Feb 29 00:00:00 2028", 1_835_395_200 - 1),
         Some(1),
