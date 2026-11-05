@@ -369,7 +369,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--remote", required=True)
     parser.add_argument("--exe", type=Path, default=Path("target/release/dispatch-mesh.exe"))
-    parser.add_argument("--report", type=Path, default=Path("reports") / f"github-workflow-test-{datetime.now(timezone.utc).date()}.md")
+    parser.add_argument("--report", type=Path, default=Path("dispatch/wiki/08_Delivery-and-QA/Reports") / f"github-workflow-test-{datetime.now(timezone.utc).date()}.md")
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--from-case")
     parser.add_argument("--only-case", action="append", choices=["live_drafts", "finish_then_edit", "offline_restart", "compatible_edits", "text_conflict", "binary_conflict", "renames_deletes", "ignored_content", "real_idle_boundary"])

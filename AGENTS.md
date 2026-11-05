@@ -18,7 +18,7 @@ The current application is a Rust console preview. Tray controls, guided account
 - `src/ai.rs`: Chat Completions summaries, recorded intent, validation, and local fallback.
 - `tests/`: CLI, engine, provider, and storage/transport integration tests.
 - `scripts/test_github_workflow.py`: optional live GitHub verification using isolated clients.
-- `reports/`: recorded verification results and known limitations.
+- `dispatch/wiki/08_Delivery-and-QA/Reports/`: recorded verification results and known limitations (in the git-ignored wiki vault).
 
 `dispatch/wiki` is the project's Obsidian vault (product concept documents and tickets), synchronized by Mesh itself. It is ignored by this repository. Do not assume it is disposable or include it in source-repository commits.
 
