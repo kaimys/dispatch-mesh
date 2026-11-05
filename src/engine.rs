@@ -36,6 +36,16 @@ impl std::fmt::Display for WorkspaceBusy {
 
 impl std::error::Error for WorkspaceBusy {}
 
+/// How long a lock attempt keeps retrying before reporting `WorkspaceBusy`.
+///
+/// On Unix these are `flock` locks, which belong to the open file description.
+/// When any thread of this process spawns a child (e.g. Git), the child holds a
+/// copy of every descriptor until it execs, so a lock this process just released
+/// can stay held for a moment. Without a short retry, an immediate re-lock fails
+/// spuriously. Real contention from another operation lasts much longer and is
+/// still reported.
+const LOCK_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+
 fn operation_lock(meta: &Path, name: &str) -> Result<File> {
     let lock = OpenOptions::new()
         .create(true)
@@ -43,15 +53,21 @@ fn operation_lock(meta: &Path, name: &str) -> Result<File> {
         .read(true)
         .write(true)
         .open(meta.join(name))?;
-    match lock.try_lock_exclusive() {
-        Ok(()) => Ok(lock),
-        Err(error)
-            if error.kind() == std::io::ErrorKind::WouldBlock
-                || [Some(33), Some(11)].contains(&error.raw_os_error()) =>
-        {
-            Err(WorkspaceBusy.into())
+    let started = std::time::Instant::now();
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => return Ok(lock),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || [Some(33), Some(11)].contains(&error.raw_os_error()) =>
+            {
+                if started.elapsed() >= LOCK_SETTLE {
+                    return Err(WorkspaceBusy.into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => return Err(error).context("Cannot lock workspace storage"),
         }
-        Err(error) => Err(error).context("Cannot lock workspace storage"),
     }
 }
 

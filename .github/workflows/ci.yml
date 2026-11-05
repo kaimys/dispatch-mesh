@@ -3,6 +3,8 @@ on: [push, pull_request]
 jobs:
   test:
     strategy:
+      # Report every platform even when one fails; a cancelled job hides its result.
+      fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
