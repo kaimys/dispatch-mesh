@@ -389,9 +389,9 @@ fn session_view(session: &SessionStatus, has_remote: bool) -> SessionView {
     }
 }
 
-/// The activity list: every unsettled session, then the most recently
-/// settled ones, each group newest first. Settling records no time, so the
-/// last save orders settled sessions.
+/// The activity list (AC 5): every unsettled session, then the
+/// [`SETTLED_SHOWN`] settled ones with the latest last save, each group
+/// newest first. Settling records no time, so the last save ranks them.
 pub fn activity(sessions: &[SessionStatus], has_remote: bool) -> Vec<SessionView> {
     let newest_first = |list: &mut Vec<&SessionStatus>| {
         list.sort_by(|a, b| (b.last_saved, &b.id).cmp(&(a.last_saved, &a.id)))
@@ -879,6 +879,32 @@ mod tests {
                 "done-7", "done-6", "done-5"
             ],
             "the ten most recently settled, published or discarded"
+        );
+    }
+
+    #[test]
+    fn activity_keeps_open_sessions_first_and_ranks_settled_ones_by_last_save() {
+        // AC 5 as amended 2026-11-06: an old open session stays above a newer
+        // published one, and a session settling late ranks by its last save.
+        let mut sessions = vec![
+            session("old-open", Stage::SavedLocally, 10),
+            session("new-published", Stage::Published, 900),
+        ];
+        assert_eq!(
+            ids(&activity(&sessions, true)),
+            ["old-open", "new-published"]
+        );
+        for n in 0..SETTLED_SHOWN as u64 {
+            sessions.push(session(&format!("recent-{n}"), Stage::Published, 500 + n));
+        }
+        // Saved long ago, settled just now after a conflict cleared.
+        sessions.push(session("settled-late", Stage::Published, 20));
+        let list = activity(&sessions, true);
+        assert_eq!(list[0].id, "old-open");
+        assert_eq!(list.len(), 1 + SETTLED_SHOWN);
+        assert!(
+            !ids(&list).contains(&"settled-late"),
+            "ranked by its last save, it falls outside the ten"
         );
     }
 

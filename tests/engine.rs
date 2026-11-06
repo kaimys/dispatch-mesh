@@ -1731,3 +1731,152 @@ fn saved_copies_from_an_earlier_version_are_listed_once_on_open() {
     let workspace = Workspace::open(&root).unwrap();
     assert_eq!(workspace.state.saved_copies.as_ref(), Some(&recorded));
 }
+
+/// The durable state a crash leaves when it interrupts displacing `note.md`
+/// ("before") to write "incoming": the copy is recorded in state and in its
+/// `record.json`, and the file was moved into it only if `moved`.
+fn interrupted_displacement(temp: &TempDir, moved: bool) -> (std::path::PathBuf, String) {
+    let mut workspace = init(temp.path(), "Alice", None);
+    fs::write(workspace.root.join("note.md"), "before").unwrap();
+    workspace.capture_at(now()).unwrap();
+    workspace.state.applying = Some(Files::from([("note.md".into(), b"incoming".to_vec())]));
+    let id = uuid::Uuid::new_v4().to_string();
+    let recovery = workspace.root.join(".mesh/recovery").join(&id);
+    fs::create_dir_all(&recovery).unwrap();
+    fs::write(
+        recovery.join("record.json"),
+        serde_json::json!({"path": "note.md", "created_at": now()}).to_string(),
+    )
+    .unwrap();
+    workspace
+        .state
+        .apply_backups
+        .insert("note.md".into(), id.clone());
+    workspace
+        .state
+        .saved_copies
+        .get_or_insert_with(Vec::new)
+        .push(SavedCopy {
+            id: id.clone(),
+            path: "note.md".into(),
+            created_at: now(),
+        });
+    workspace.save().unwrap();
+    if moved {
+        fs::rename(workspace.root.join("note.md"), recovery.join("content")).unwrap();
+    }
+    (workspace.root.clone(), id)
+}
+
+/// Every listed copy holds content, in state and in a read-only status.
+fn assert_copies_exist(root: &Path) -> Vec<SavedCopy> {
+    let workspace = Workspace::open(root).unwrap();
+    assert!(workspace.state.applying.is_none() && workspace.state.apply_backups.is_empty());
+    let copies = workspace.status_snapshot().saved_copies;
+    for copy in &copies {
+        assert!(
+            root.join(".mesh/recovery")
+                .join(&copy.id)
+                .join("content")
+                .is_file(),
+            "{copy:?} lists a copy that does not exist"
+        );
+    }
+    drop(workspace);
+    assert_eq!(
+        Workspace::inspect(root)
+            .unwrap()
+            .status_snapshot()
+            .saved_copies,
+        copies
+    );
+    copies
+}
+
+#[test]
+fn a_crash_before_the_move_then_a_newer_save_lists_no_phantom_copy() {
+    let temp = TempDir::new().unwrap();
+    let (root, id) = interrupted_displacement(&temp, false);
+    fs::write(root.join("note.md"), "newer local edit").unwrap();
+    let copies = assert_copies_exist(&root);
+    assert!(copies.is_empty(), "{copies:?}");
+    assert_eq!(
+        fs::read_to_string(root.join("note.md")).unwrap(),
+        "newer local edit",
+        "the newer save survives"
+    );
+    assert!(
+        root.join(".mesh/recovery")
+            .join(&id)
+            .join("record.json")
+            .is_file(),
+        "recovery files are never deleted"
+    );
+}
+
+#[test]
+fn a_crash_before_the_move_with_the_file_already_written_lists_no_phantom_copy() {
+    let temp = TempDir::new().unwrap();
+    let (root, _) = interrupted_displacement(&temp, false);
+    fs::write(root.join("note.md"), "incoming").unwrap();
+    assert!(assert_copies_exist(&root).is_empty());
+    assert_eq!(fs::read(root.join("note.md")).unwrap(), b"incoming");
+}
+
+#[test]
+fn a_crash_before_the_move_then_a_replay_lists_only_the_copy_it_made() {
+    let temp = TempDir::new().unwrap();
+    let (root, abandoned) = interrupted_displacement(&temp, false);
+    let copies = assert_copies_exist(&root);
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    assert_ne!(copies[0].id, abandoned);
+    assert_eq!(fs::read(root.join("note.md")).unwrap(), b"incoming");
+    let content = root
+        .join(".mesh/recovery")
+        .join(&copies[0].id)
+        .join("content");
+    assert_eq!(fs::read(content).unwrap(), b"before");
+}
+
+#[test]
+fn a_crash_after_the_move_keeps_the_real_copy() {
+    let temp = TempDir::new().unwrap();
+    let (root, id) = interrupted_displacement(&temp, true);
+    let copies = assert_copies_exist(&root);
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    assert_eq!(copies[0].id, id);
+    assert_eq!(fs::read(root.join("note.md")).unwrap(), b"incoming");
+    let content = root.join(".mesh/recovery").join(&id).join("content");
+    assert_eq!(fs::read(content).unwrap(), b"before");
+}
+
+#[test]
+fn a_legacy_record_without_content_is_not_backfilled() {
+    let temp = TempDir::new().unwrap();
+    let root = displacing(&temp);
+    let real = Workspace::open(&root).unwrap().state.saved_copies.unwrap();
+    // An older version stopped between writing the record and moving the file.
+    let empty = root
+        .join(".mesh/recovery")
+        .join(uuid::Uuid::new_v4().to_string());
+    fs::create_dir_all(&empty).unwrap();
+    fs::write(
+        empty.join("record.json"),
+        serde_json::json!({"path": "other.md", "created_at": now()}).to_string(),
+    )
+    .unwrap();
+    let mut workspace = Workspace::open(&root).unwrap();
+    workspace.state.saved_copies = None;
+    workspace.save().unwrap();
+    drop(workspace);
+    assert_eq!(
+        Workspace::inspect(&root)
+            .unwrap()
+            .status_snapshot()
+            .saved_copies,
+        real,
+        "a read-only status skips it too"
+    );
+    assert_eq!(assert_copies_exist(&root), real);
+    assert!(empty.join("record.json").is_file(), "left in place");
+}

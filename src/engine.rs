@@ -83,7 +83,8 @@ pub const RECEIVED_DRAFT_DEPENDENCY: &str = "Edits depend on a received draft";
 pub const LAST_SYNC_PRECISION: u64 = 60;
 
 /// Saved copies as the recovery folder records them, oldest first. Entries
-/// whose folder name is not a Mesh id or whose record cannot be read are skipped.
+/// whose folder name is not a Mesh id, whose record cannot be read, or that
+/// hold no content (a displacement interrupted before its move) are skipped.
 fn recorded_copies(root: &Path) -> Vec<SavedCopy> {
     #[derive(serde::Deserialize)]
     struct Record {
@@ -98,6 +99,9 @@ fn recorded_copies(root: &Path) -> Vec<SavedCopy> {
         .filter_map(|entry| {
             let id = entry.file_name().into_string().ok()?;
             Uuid::parse_str(&id).ok()?;
+            if !entry.path().join("content").is_file() {
+                return None;
+            }
             let record: Record =
                 serde_json::from_slice(&fs::read(entry.path().join("record.json")).ok()?).ok()?;
             Some(SavedCopy {
@@ -1175,6 +1179,26 @@ impl Workspace {
         let Some(desired) = self.state.applying.clone() else {
             return Ok(());
         };
+        // A displacement interrupted before its move left a record but no copy.
+        // Forget that bookkeeping, whichever way this replay goes on; the
+        // recovery folder itself stays untouched.
+        let recovery = self.root.join(".mesh/recovery");
+        let never_moved: BTreeSet<String> = self
+            .state
+            .apply_backups
+            .values()
+            .filter(|id| !recovery.join(id).join("content").exists())
+            .cloned()
+            .collect();
+        if !never_moved.is_empty() {
+            self.state
+                .apply_backups
+                .retain(|_, id| !never_moved.contains(id));
+            if let Some(copies) = &mut self.state.saved_copies {
+                copies.retain(|copy| !never_moved.contains(&copy.id));
+            }
+            self.save()?;
+        }
         // Decided from the journal itself, so a replay after a crash leaves the same
         // files alone. A path the incoming rules exclude is neither written nor
         // removed, and leaves the observed view (ADR-0013).
@@ -1235,24 +1259,14 @@ impl Workspace {
                     &serde_json::json!({"path": path, "created_at": created_at}),
                 )?;
                 let backup = recovery.join("content");
-                let copies = self.state.saved_copies.get_or_insert_with(Vec::new);
-                // A replay after a crash before the move leaves an empty
-                // recovery folder behind; only the copy that holds the file counts.
-                if let Some(abandoned) = self.state.apply_backups.get(&path)
-                    && !self
-                        .root
-                        .join(".mesh/recovery")
-                        .join(abandoned)
-                        .join("content")
-                        .exists()
-                {
-                    copies.retain(|copy| &copy.id != abandoned);
-                }
-                copies.push(SavedCopy {
-                    id: backup_id.clone(),
-                    path: path.clone(),
-                    created_at,
-                });
+                self.state
+                    .saved_copies
+                    .get_or_insert_with(Vec::new)
+                    .push(SavedCopy {
+                        id: backup_id.clone(),
+                        path: path.clone(),
+                        created_at,
+                    });
                 self.state.apply_backups.insert(path.clone(), backup_id);
                 self.save()?;
                 fs::rename(&target, &backup)?;
