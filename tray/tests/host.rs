@@ -269,3 +269,105 @@ fn quit_waits_for_a_start_in_flight_and_its_final_capture() {
     host.start_all();
     drop(runner::acquire(&wiki).unwrap());
 }
+
+fn status(workspace: &Workspace) -> Option<&dispatch_mesh::status::Status> {
+    match &workspace.state {
+        WorkspaceState::Running(Some(snapshot)) => Some(&snapshot.status),
+        _ => None,
+    }
+}
+
+#[test]
+fn finish_closes_the_open_session_like_the_cli() {
+    use dispatch_mesh::status::Stage;
+    let parent = tempfile::tempdir().unwrap();
+    let wiki = workspace(&parent, "Team Wiki");
+    let (host, _) = host(std::slice::from_ref(&wiki));
+    host.start_all();
+    wait_until(&host, "runs", |w| published(&w[0]));
+    assert_eq!(host.finish(0).unwrap(), None, "no session yet");
+
+    std::fs::write(wiki.join("note.md"), "draft").unwrap();
+    let workspaces = wait_until(&host, "a session opens", |w| {
+        status(&w[0]).is_some_and(|s| s.active_session.is_some())
+    });
+    let open = status(&workspaces[0]).unwrap().active_session.clone();
+    let finished = host.finish(0).unwrap();
+    assert_eq!(finished, open);
+    let id = finished.unwrap();
+    wait_until(&host, "the snapshot shows it finishing up", |w| {
+        status(&w[0]).is_some_and(|s| {
+            s.active_session.is_none()
+                && s.sessions.iter().any(|session| {
+                    session.id == id
+                        && session.closed
+                        && matches!(
+                            session.stage,
+                            Stage::WaitingForFinalization | Stage::Published
+                        )
+                })
+        })
+    });
+    host.quit();
+}
+
+#[test]
+fn finish_is_refused_where_the_engine_does_not_run_here() {
+    let parent = tempfile::tempdir().unwrap();
+    let held = workspace(&parent, "Held");
+    let _lease = runner::acquire(&held).unwrap();
+    let (host, _) = host(std::slice::from_ref(&held));
+    host.start_all();
+    wait_until(&host, "refused", |w| {
+        w[0].state == WorkspaceState::AlreadyRunning
+    });
+    assert!(host.finish(0).is_err());
+    assert!(host.finish(7).is_err(), "unknown workspace");
+    host.quit();
+}
+
+#[test]
+fn saved_copies_resolve_only_from_ids_the_status_lists() {
+    let parent = tempfile::tempdir().unwrap();
+    let wiki = workspace(&parent, "Team Wiki");
+    {
+        // The next open displaces note.md to write the incoming version.
+        let mut engine = Engine::open(&wiki).unwrap();
+        std::fs::write(wiki.join("note.md"), "before").unwrap();
+        engine.capture_at(dispatch_mesh::model::now()).unwrap();
+        engine.state.applying = Some(
+            [("note.md".to_owned(), b"incoming".to_vec())]
+                .into_iter()
+                .collect(),
+        );
+        engine.save().unwrap();
+    }
+    let (host, _) = host(std::slice::from_ref(&wiki));
+    host.start_all();
+    let workspaces = wait_until(&host, "the copy is listed", |w| {
+        status(&w[0]).is_some_and(|s| !s.saved_copies.is_empty())
+    });
+    let copy = status(&workspaces[0]).unwrap().saved_copies[0].clone();
+    assert_eq!(copy.path, "note.md");
+
+    let location = host.saved_copy_location(0, &copy.id).unwrap();
+    assert_eq!(std::fs::read(&location).unwrap(), b"before");
+    assert!(location.starts_with(wiki.join(".mesh").join("recovery")));
+
+    let unknown = "00000000-0000-4000-8000-000000000000";
+    for refused in [
+        unknown,
+        "../../note.md",
+        r"C:\Windows",
+        &format!("{}/../x", copy.id),
+        "",
+    ] {
+        assert_eq!(host.saved_copy_location(0, refused), None, "{refused}");
+    }
+    assert_eq!(
+        host.saved_copy_location(3, &copy.id),
+        None,
+        "unknown workspace"
+    );
+    host.quit();
+}

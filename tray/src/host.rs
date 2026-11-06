@@ -5,8 +5,11 @@
 //! starting, refusing, retrying and quitting are tested with real workspaces.
 
 use crate::model::{Workspace, WorkspaceState};
-use anyhow::{Context, Result};
-use dispatch_mesh::runner::{AlreadyRunning, Runner, RunnerHandle, StatusReceiver};
+use anyhow::{Context, Result, bail};
+use dispatch_mesh::{
+    engine::{Workspace as Engine, WorkspaceBusy},
+    runner::{AlreadyRunning, Runner, RunnerHandle, StatusReceiver},
+};
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -251,6 +254,61 @@ impl Host {
             _ => "The Mesh engine stopped.".to_owned(),
         };
         self.update(id, generation, WorkspaceState::Stopped(reason));
+    }
+
+    /// Close the workspace's open session, exactly as CLI `session finish`
+    /// does next to a running engine; that engine then summarizes and
+    /// publishes it, and its next snapshot shows the session finishing up.
+    /// Refused unless the engine runs here, because then this host does not
+    /// look after the workspace. Waits for the engine's current operation, so
+    /// call it off the UI thread. Returns the finished session's id, if any.
+    pub fn finish(&self, id: usize) -> Result<Option<String>> {
+        let path = {
+            let entries = self.entries.lock().unwrap();
+            let entry = entries.get(id).context("No such workspace")?;
+            if entry.handle.is_none()
+                || !matches!(entry.workspace.state, WorkspaceState::Running(_))
+            {
+                bail!("Mesh is not running this workspace here");
+            }
+            entry.workspace.path.clone()
+        };
+        let started = std::time::Instant::now();
+        let mut workspace = loop {
+            match Engine::open(&path) {
+                Ok(workspace) => break workspace,
+                Err(error)
+                    if error.is::<WorkspaceBusy>()
+                        && started.elapsed() < std::time::Duration::from_secs(30) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50))
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        workspace.finish()
+    }
+
+    /// Where a saved copy listed in the workspace's latest status is kept, or
+    /// `None` for an id that status does not list. The window sends only ids,
+    /// never paths, so it cannot point at anything else on disk.
+    pub fn saved_copy_location(&self, id: usize, copy: &str) -> Option<PathBuf> {
+        uuid::Uuid::try_parse(copy).ok()?;
+        let entries = self.entries.lock().unwrap();
+        let workspace = &entries.get(id)?.workspace;
+        workspace
+            .status()?
+            .saved_copies
+            .iter()
+            .any(|saved| saved.id == copy)
+            .then(|| {
+                workspace
+                    .path
+                    .join(".mesh")
+                    .join("recovery")
+                    .join(copy)
+                    .join("content")
+            })
     }
 
     /// Stop every engine and wait for each to capture saved changes. Engines

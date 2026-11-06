@@ -41,6 +41,41 @@ fn retry(state: State<Tray>, id: usize) {
     std::thread::spawn(move || host.retry(id));
 }
 
+/// Close the workspace's open session (US00005). Waits for the engine's
+/// current operation on a worker thread; the window learns the outcome from
+/// the next snapshot, or from the error.
+#[tauri::command]
+async fn finish_session(state: State<'_, Tray>, id: usize) -> Result<(), String> {
+    let host = Arc::clone(&state.host);
+    tauri::async_runtime::spawn_blocking(move || host.finish(id))
+        .await
+        .map_err(|error| error.to_string())?
+        .map(|_| ())
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Open Explorer with a saved copy selected. The window names the copy by
+/// id; the host resolves it, so no path ever comes from the page.
+#[tauri::command]
+fn show_saved_copy(state: State<Tray>, id: usize, copy: String) -> Result<(), String> {
+    let location = state
+        .host
+        .saved_copy_location(id, &copy)
+        .ok_or("This saved copy is no longer listed.")?;
+    tauri_plugin_opener::reveal_item_in_dir(location).map_err(|error| error.to_string())
+}
+
+/// The tray menu's Finish-session item for workspace `id`.
+pub fn finish_from_menu(app: &AppHandle, id: usize) {
+    if let Some(state) = app.try_state::<Tray>() {
+        let host = Arc::clone(&state.host);
+        // Failures need no dialog: the session stays open and the window shows it.
+        std::thread::spawn(move || {
+            let _ = host.finish(id);
+        });
+    }
+}
+
 fn on_change(app: &AppHandle, workspaces: &[Workspace]) {
     tray::update(app, workspaces);
     let _ = app.emit("workspaces", model::view(workspaces));
@@ -99,7 +134,12 @@ fn main() {
     let args = Args::parse();
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
-        .invoke_handler(tauri::generate_handler![workspaces, retry])
+        .invoke_handler(tauri::generate_handler![
+            workspaces,
+            retry,
+            finish_session,
+            show_saved_copy
+        ])
         .setup(move |app| {
             let handle = app.handle().clone();
             tray::create(&handle)?;

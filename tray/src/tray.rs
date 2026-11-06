@@ -64,6 +64,8 @@ struct Look {
 struct TrayState {
     look: Option<Look>,
     hint: bool,
+    /// Finish-session items as (label, workspace id).
+    finish: Vec<(String, usize)>,
     tooltip: String,
     icon: Option<Icon>,
 }
@@ -124,15 +126,43 @@ fn dark_taskbar() -> bool {
     false
 }
 
-fn menu(app: &AppHandle, hint: bool) -> tauri::Result<Menu<tauri::Wry>> {
+const FINISH_PREFIX: &str = "finish-";
+
+fn menu(
+    app: &AppHandle,
+    hint: bool,
+    finish: &[(String, usize)],
+) -> tauri::Result<Menu<tauri::Wry>> {
     let menu = Menu::with_items(
         app,
-        &[
-            &MenuItem::with_id(app, "open", "Open status window", true, None::<&str>)?,
-            &PredefinedMenuItem::separator(app)?,
-            &MenuItem::with_id(app, "quit", "Quit Dispatch Mesh", true, None::<&str>)?,
-        ],
+        &[&MenuItem::with_id(
+            app,
+            "open",
+            "Open status window",
+            true,
+            None::<&str>,
+        )?],
     )?;
+    if !finish.is_empty() {
+        menu.append(&PredefinedMenuItem::separator(app)?)?;
+        for (label, id) in finish {
+            menu.append(&MenuItem::with_id(
+                app,
+                format!("{FINISH_PREFIX}{id}"),
+                label,
+                true,
+                None::<&str>,
+            )?)?;
+        }
+    }
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
+    menu.append(&MenuItem::with_id(
+        app,
+        "quit",
+        "Quit Dispatch Mesh",
+        true,
+        None::<&str>,
+    )?)?;
     if hint {
         // Quit never prompts; this answers "will I lose anything?" beforehand.
         menu.append(&MenuItem::with_id(
@@ -156,12 +186,19 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     TrayIconBuilder::with_id(TRAY)
         .icon(image(look)?)
         .tooltip("Dispatch Mesh — Starting")
-        .menu(&menu(app, false)?)
+        .menu(&menu(app, false, &[])?)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => crate::show_window(app),
             "quit" => crate::quit(app),
-            _ => {}
+            other => {
+                if let Some(id) = other
+                    .strip_prefix(FINISH_PREFIX)
+                    .and_then(|id| id.parse().ok())
+                {
+                    crate::finish_from_menu(app, id);
+                }
+            }
         })
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {
@@ -186,15 +223,17 @@ pub fn update(app: &AppHandle, workspaces: &[Workspace]) {
     state.icon = Some(model::aggregate(workspaces));
     state.tooltip = model::tooltip(workspaces);
     let hint = model::any_open_session(workspaces);
+    let finish = model::finish_items(workspaces);
     let Some(tray) = app.tray_by_id(TRAY) else {
         return;
     };
     let _ = tray.set_tooltip(Some(&state.tooltip));
-    if hint != state.hint
-        && let Ok(menu) = menu(app, hint)
+    if (hint != state.hint || finish != state.finish)
+        && let Ok(menu) = menu(app, hint, &finish)
         && tray.set_menu(Some(menu)).is_ok()
     {
         state.hint = hint;
+        state.finish = finish;
     }
     refresh_icon(app, &mut state);
 }

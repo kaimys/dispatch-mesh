@@ -72,6 +72,13 @@ fn operation_lock(meta: &Path, name: &str) -> Result<File> {
     }
 }
 
+/// How the attention reason of a failed sync begins. Mesh retries it on the next cycle.
+pub const SYNC_FAILURE: &str = "Synchronization waiting: ";
+
+/// How the attention reason begins when edits depend on a received draft;
+/// finishing the session resolves it.
+pub const RECEIVED_DRAFT_DEPENDENCY: &str = "Edits depend on a received draft";
+
 /// `last_sync` is rewritten only when the stored time is at least this old.
 pub const LAST_SYNC_PRECISION: u64 = 60;
 
@@ -530,7 +537,9 @@ impl Workspace {
                     Some(content) => content,
                     None => {
                         self.state.pending_capture = Some(files.clone());
-                        self.state.attention = Some("Edits depend on a received draft and cannot be attributed safely. Bytes are saved locally. Use session finish to checkpoint the current draft; the dependent edits will enter the next session.".into());
+                        self.state.attention = Some(format!(
+                            "{RECEIVED_DRAFT_DEPENDENCY} and cannot be attributed safely. Bytes are saved locally. Use session finish to checkpoint the current draft; the dependent edits will enter the next session."
+                        ));
                         self.save()?;
                         bail!(
                             "Dependent edits preserved; finish the current session before continuing synchronization"
@@ -911,7 +920,6 @@ impl Workspace {
     /// Record why a sync failed. An unreachable remote is `offline`; every other
     /// failure, including unclassified ones, needs the user's attention (ADR-0010).
     pub fn record_sync_failure(&mut self, error: &anyhow::Error) {
-        const SYNC_FAILURE: &str = "Synchronization waiting: ";
         let message = format!("{error:#}");
         if crate::git::failure_kind(error) == Some(crate::git::GitFailureKind::Offline) {
             // Replace a previous sync failure, but keep engine-raised attention.
