@@ -72,6 +72,38 @@ fn operation_lock(meta: &Path, name: &str) -> Result<File> {
     }
 }
 
+/// `last_sync` is rewritten only when the stored time is at least this old.
+pub const LAST_SYNC_PRECISION: u64 = 60;
+
+/// Saved copies as the recovery folder records them, oldest first. Entries
+/// whose folder name is not a Mesh id or whose record cannot be read are skipped.
+fn recorded_copies(root: &Path) -> Vec<SavedCopy> {
+    #[derive(serde::Deserialize)]
+    struct Record {
+        path: String,
+        created_at: u64,
+    }
+    let Ok(entries) = fs::read_dir(root.join(".mesh/recovery")) else {
+        return Vec::new();
+    };
+    let mut copies: Vec<SavedCopy> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let id = entry.file_name().into_string().ok()?;
+            Uuid::parse_str(&id).ok()?;
+            let record: Record =
+                serde_json::from_slice(&fs::read(entry.path().join("record.json")).ok()?).ok()?;
+            Some(SavedCopy {
+                id,
+                path: record.path,
+                created_at: record.created_at,
+            })
+        })
+        .collect();
+    copies.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+    copies
+}
+
 fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
     use std::io::Write;
     let mut temp = tempfile::NamedTempFile::new_in(path.parent().context("Missing parent")?)?;
@@ -211,6 +243,11 @@ impl Workspace {
             db,
             _lock: Some(lock),
         };
+        if workspace.state.saved_copies.is_none() {
+            // Workspaces from before saved copies were recorded: list what is
+            // already in the folder, once.
+            workspace.state.saved_copies = Some(recorded_copies(&workspace.root));
+        }
         workspace.recover_apply()?;
         // A no-op save also atomically upgrades a version-one local snapshot.
         workspace.save()?;
@@ -640,7 +677,27 @@ impl Workspace {
         }
         self.state.attention = None;
         self.state.offline = None;
+        if self.config.remote.is_some() {
+            let timestamp = now();
+            if self
+                .state
+                .last_sync
+                .is_none_or(|last| timestamp.saturating_sub(last) >= LAST_SYNC_PRECISION)
+            {
+                self.state.last_sync = Some(timestamp);
+            }
+        }
         self.save()
+    }
+
+    /// Displaced files in the order they were kept: recorded in state, or for
+    /// a read-only view of a workspace that has not recorded them yet, read
+    /// from the recovery folder.
+    pub fn saved_copies(&self) -> Vec<SavedCopy> {
+        match &self.state.saved_copies {
+            Some(copies) => copies.clone(),
+            None => recorded_copies(&self.root),
+        }
     }
 
     fn fetch(&mut self) -> Result<()> {
@@ -1161,12 +1218,31 @@ impl Workspace {
             if current.is_some() {
                 let backup_id = Uuid::new_v4().to_string();
                 let recovery = self.root.join(".mesh/recovery").join(&backup_id);
+                let created_at = now();
                 fs::create_dir_all(&recovery)?;
                 write_json(
                     &recovery.join("record.json"),
-                    &serde_json::json!({"path": path, "created_at": now()}),
+                    &serde_json::json!({"path": path, "created_at": created_at}),
                 )?;
                 let backup = recovery.join("content");
+                let copies = self.state.saved_copies.get_or_insert_with(Vec::new);
+                // A replay after a crash before the move leaves an empty
+                // recovery folder behind; only the copy that holds the file counts.
+                if let Some(abandoned) = self.state.apply_backups.get(&path)
+                    && !self
+                        .root
+                        .join(".mesh/recovery")
+                        .join(abandoned)
+                        .join("content")
+                        .exists()
+                {
+                    copies.retain(|copy| &copy.id != abandoned);
+                }
+                copies.push(SavedCopy {
+                    id: backup_id.clone(),
+                    path: path.clone(),
+                    created_at,
+                });
                 self.state.apply_backups.insert(path.clone(), backup_id);
                 self.save()?;
                 fs::rename(&target, &backup)?;

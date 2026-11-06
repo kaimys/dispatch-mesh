@@ -355,6 +355,9 @@ mod tests {
             sessions: Vec::new(),
             unresolved_conflicts: Vec::new(),
             presence: Vec::new(),
+            has_remote: true,
+            last_sync: None,
+            saved_copies: Vec::new(),
         }
     }
 

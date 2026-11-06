@@ -115,6 +115,8 @@ impl<A> State<A> {
             uploaded: self.uploaded,
             offline: self.offline,
             summary_failure: self.summary_failure,
+            last_sync: self.last_sync,
+            saved_copies: self.saved_copies,
         })
     }
 }

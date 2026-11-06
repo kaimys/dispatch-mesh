@@ -541,3 +541,92 @@ fn init_in_an_obsidian_vault_excludes_only_the_per_device_layout() {
     assert!(shared.contains_key(".obsidian/app.json"));
     assert!(!shared.contains_key(".obsidian/workspace.json"));
 }
+
+#[test]
+fn status_json_adds_session_detail_without_changing_existing_fields() {
+    let temp = tempfile::tempdir().unwrap();
+    let mesh = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_dispatch-mesh"))
+            .arg("--workspace")
+            .arg(temp.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    let status =
+        || -> serde_json::Value { serde_json::from_slice(&mesh(&["status"]).stdout).unwrap() };
+    mesh(&["init", "--name", "Alice", "--email", "alice@example.test"]);
+    mesh(&[
+        "intent",
+        "begin",
+        "--purpose",
+        "Explain setup",
+        "--paths",
+        "guide.md",
+    ]);
+    fs::write(temp.path().join("guide.md"), "setup steps").unwrap();
+    mesh(&["session", "finish"]);
+
+    let open = status();
+    // Every field 0.2 reported keeps its name (US00005, AC 12).
+    for key in [
+        "status",
+        "reason",
+        "device",
+        "main",
+        "commit_message_mode",
+        "attention",
+        "offline",
+        "summary_failure",
+        "capture_error",
+        "local_changes_waiting",
+        "recovery_pending",
+        "active_session",
+        "sessions",
+        "unresolved_conflicts",
+        "presence",
+    ] {
+        assert!(open.get(key).is_some(), "{key} missing: {open:#}");
+    }
+    let session = &open["sessions"][0];
+    for key in [
+        "id",
+        "author",
+        "stage",
+        "closed",
+        "published",
+        "discarded",
+        "files",
+        "dependencies",
+    ] {
+        assert!(session.get(key).is_some(), "{key} missing: {session:#}");
+    }
+    assert_eq!(session["stage"], "waiting_for_finalization");
+    assert_eq!(session["author"]["name"], "Alice");
+    assert_eq!(session["purposes"], serde_json::json!(["Explain setup"]));
+    assert!(session["title"].is_null(), "not published yet: {session:#}");
+    let started = session["started_at"].as_u64().unwrap();
+    assert!(started > 0 && session["last_saved"].as_u64().unwrap() >= started);
+    assert_eq!(open["has_remote"], false);
+    assert!(open["last_sync"].is_null(), "no remote, never synced");
+    assert_eq!(open["saved_copies"], serde_json::json!([]));
+
+    mesh(&["sync"]);
+    let published = status();
+    let session = &published["sessions"][0];
+    assert_eq!(session["stage"], "published");
+    assert!(
+        session["title"].as_str().is_some_and(|t| !t.is_empty()),
+        "{session:#}"
+    );
+    assert!(
+        published["last_sync"].is_null(),
+        "a workspace without a remote never syncs"
+    );
+}

@@ -7,7 +7,7 @@
 
 use crate::{
     engine::Workspace,
-    model::{Identity, Session, now},
+    model::{Identity, SavedCopy, Session, now},
 };
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -44,6 +44,14 @@ pub struct SessionStatus {
     pub discarded: bool,
     pub files: Vec<String>,
     pub dependencies: BTreeSet<String>,
+    /// When the session's first edit was captured.
+    pub started_at: u64,
+    /// When its latest edit was captured.
+    pub last_saved: u64,
+    /// The summary title it was added to shared history with; `None` until published.
+    pub title: Option<String>,
+    /// Requested purposes of its recorded intents, in recorded order, without repeats.
+    pub purposes: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -80,6 +88,13 @@ pub struct Status {
     pub sessions: Vec<SessionStatus>,
     pub unresolved_conflicts: Vec<ConflictStatus>,
     pub presence: Vec<Presence>,
+    /// Whether the workspace synchronizes with a remote at all.
+    pub has_remote: bool,
+    /// When a sync with the remote last succeeded, to the minute; `None` if never.
+    pub last_sync: Option<u64>,
+    /// Files Mesh moved aside before writing incoming changes, oldest first.
+    /// Each lives in `.mesh/recovery/<id>/content`.
+    pub saved_copies: Vec<SavedCopy>,
 }
 
 /// What is known about the live folder beyond committed state.
@@ -222,6 +237,14 @@ impl Workspace {
                 .sessions
                 .values()
                 .map(|s| SessionStatus {
+                    started_at: s.created_at,
+                    last_saved: s.last_edit,
+                    title: s
+                        .message
+                        .as_ref()
+                        .filter(|_| s.published)
+                        .map(|m| m.title.clone()),
+                    purposes: purposes(s),
                     id: s.id.clone(),
                     author: s.author.clone(),
                     stage: self.session_stage(s),
@@ -234,6 +257,22 @@ impl Workspace {
                 .collect(),
             unresolved_conflicts: unresolved,
             presence,
+            has_remote: self.config.remote.is_some(),
+            last_sync: self.state.last_sync,
+            saved_copies: self.saved_copies(),
         }
     }
+}
+
+/// A session's requested purposes in the order they were recorded.
+fn purposes(session: &Session) -> Vec<String> {
+    let mut intents: Vec<_> = session.intents.values().collect();
+    intents.sort_by_key(|intent| intent.created_at);
+    let mut purposes: Vec<String> = Vec::new();
+    for intent in intents {
+        if !purposes.contains(&intent.purpose) {
+            purposes.push(intent.purpose.clone());
+        }
+    }
+    purposes
 }

@@ -763,12 +763,19 @@ fn upload_bookkeeping_stays_local_and_never_causes_another_push() {
 fn older_state_without_the_new_fields_loads_with_empty_defaults() {
     let mut value = serde_json::to_value(State::<Vec<u8>>::default()).unwrap();
     let object = value.as_object_mut().unwrap();
-    for key in ["uploaded", "offline", "summary_failure"] {
+    for key in [
+        "uploaded",
+        "offline",
+        "summary_failure",
+        "last_sync",
+        "saved_copies",
+    ] {
         assert!(object.remove(key).is_some(), "{key} is serialized");
     }
     let state: State = serde_json::from_value(value).unwrap();
     assert!(state.uploaded.is_empty());
     assert!(state.offline.is_none() && state.summary_failure.is_none());
+    assert!(state.last_sync.is_none() && state.saved_copies.is_none());
 }
 
 #[test]
@@ -1552,4 +1559,157 @@ fn a_rule_file_inside_an_excluded_folder_stays_out() {
     let files = shared(&workspace);
     assert!(files.contains_key(".gitignore"));
     assert!(!files.contains_key("build/.meshignore"));
+}
+
+#[test]
+fn last_sync_is_recorded_on_success_survives_reopening_and_is_coalesced() {
+    use dispatch_mesh::engine::LAST_SYNC_PRECISION;
+    let temp = TempDir::new().unwrap();
+    let origin = temp.path().join("remote.git");
+    remote(&origin);
+    let mut alice = init(&temp.path().join("alice"), "Alice", Some(&origin));
+    let root = alice.root.clone();
+    assert_eq!(alice.status_snapshot().last_sync, None, "never synced");
+    assert!(alice.status_snapshot().has_remote);
+
+    alice.sync().unwrap();
+    let first = alice
+        .status_snapshot()
+        .last_sync
+        .expect("set by a successful sync");
+    assert!(now().saturating_sub(first) < 5);
+    drop(alice);
+    let mut alice = Workspace::open(&root).unwrap();
+    assert_eq!(alice.status_snapshot().last_sync, Some(first), "persisted");
+
+    // Within the precision window the stored time is left alone, so an idle
+    // workspace does not rewrite its state every cycle.
+    let recent = first - (LAST_SYNC_PRECISION - 10);
+    alice.state.last_sync = Some(recent);
+    alice.save().unwrap();
+    alice.sync().unwrap();
+    assert_eq!(alice.state.last_sync, Some(recent));
+    // Once it is a full minute old, the next success rewrites it.
+    let stale = first - LAST_SYNC_PRECISION;
+    alice.state.last_sync = Some(stale);
+    alice.save().unwrap();
+    alice.sync().unwrap();
+    assert!(alice.state.last_sync.unwrap() >= first);
+
+    // A failed sync keeps the last success.
+    let before = alice.state.last_sync;
+    alice.config.remote = Some(temp.path().join("missing.git").display().to_string());
+    alice.save_config().unwrap();
+    assert!(Workspace::sync_and_record(&root).is_err());
+    assert_eq!(Workspace::inspect(&root).unwrap().state.last_sync, before);
+}
+
+#[test]
+fn a_workspace_without_a_remote_never_records_a_sync() {
+    let temp = TempDir::new().unwrap();
+    let mut alice = init(temp.path(), "Alice", None);
+    fs::write(alice.root.join("note.md"), "local").unwrap();
+    finish(&mut alice);
+    let status = alice.status_snapshot();
+    assert!(!status.has_remote);
+    assert_eq!(status.last_sync, None);
+}
+
+#[test]
+fn session_status_carries_times_purposes_and_the_published_title() {
+    let temp = TempDir::new().unwrap();
+    let origin = temp.path().join("remote.git");
+    remote(&origin);
+    let mut alice = init(&temp.path().join("alice"), "Alice", Some(&origin));
+    let mut bob = init(&temp.path().join("bob"), "Bob", Some(&origin));
+    for purpose in ["Explain setup", "Fix typos", "Explain setup"] {
+        let intent = alice
+            .register_intent(purpose.into(), BTreeSet::from(["guide.md".into()]))
+            .unwrap();
+        fs::write(alice.root.join("guide.md"), purpose).unwrap();
+        alice.end_intent(&intent).unwrap();
+    }
+    let id = alice.active_session().unwrap().id.clone();
+    let stored = alice.state.manifest.sessions[&id].clone();
+    let status = alice.status_snapshot();
+    let session = status.sessions.iter().find(|s| s.id == id).unwrap();
+    assert_eq!(session.started_at, stored.created_at);
+    assert_eq!(session.last_saved, stored.last_edit);
+    assert_eq!(session.purposes, ["Explain setup", "Fix typos"]);
+    assert_eq!(session.title, None, "open sessions have no title");
+
+    alice.sync().unwrap();
+    bob.sync().unwrap();
+    let received = bob.status_snapshot();
+    let session = received.sessions.iter().find(|s| s.id == id).unwrap();
+    assert_eq!(session.author.name, "Alice", "never the receiving user");
+    assert_eq!(session.purposes, ["Explain setup", "Fix typos"]);
+
+    finish(&mut alice);
+    let status = alice.status_snapshot();
+    let session = status.sessions.iter().find(|s| s.id == id).unwrap();
+    assert!(session.published);
+    let message = alice.state.manifest.sessions[&id].message.clone().unwrap();
+    assert_eq!(session.title.as_deref(), Some(message.title.as_str()));
+}
+
+/// A workspace whose next open displaces `note.md` ("before") to write "incoming".
+fn displacing(temp: &TempDir) -> std::path::PathBuf {
+    let mut workspace = init(temp.path(), "Alice", None);
+    fs::write(workspace.root.join("note.md"), "before").unwrap();
+    workspace.capture_at(now()).unwrap();
+    workspace.state.applying = Some(Files::from([("note.md".into(), b"incoming".to_vec())]));
+    workspace.save().unwrap();
+    workspace.root.clone()
+}
+
+#[test]
+fn a_displaced_file_is_listed_as_a_saved_copy() {
+    let temp = TempDir::new().unwrap();
+    let root = displacing(&temp);
+    let workspace = Workspace::open(&root).unwrap();
+    let copies = workspace.status_snapshot().saved_copies;
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    assert_eq!(copies[0].path, "note.md");
+    assert!(now().saturating_sub(copies[0].created_at) < 5);
+    let content = root
+        .join(".mesh/recovery")
+        .join(&copies[0].id)
+        .join("content");
+    assert_eq!(fs::read(content).unwrap(), b"before");
+    drop(workspace);
+    assert_eq!(
+        Workspace::inspect(&root)
+            .unwrap()
+            .status_snapshot()
+            .saved_copies,
+        copies,
+        "recorded in state"
+    );
+}
+
+#[test]
+fn saved_copies_from_an_earlier_version_are_listed_once_on_open() {
+    let temp = TempDir::new().unwrap();
+    let root = displacing(&temp);
+    let workspace = Workspace::open(&root).unwrap();
+    let recorded = workspace.state.saved_copies.clone().unwrap();
+    drop(workspace);
+    // A not-a-copy folder next to it, as left by hand or by a test.
+    fs::create_dir_all(root.join(".mesh/recovery/not-an-id")).unwrap();
+    // Forget the record, as a 0.2 workspace never had one.
+    let mut workspace = Workspace::open(&root).unwrap();
+    workspace.state.saved_copies = None;
+    workspace.save().unwrap();
+    drop(workspace);
+    assert_eq!(
+        Workspace::inspect(&root)
+            .unwrap()
+            .status_snapshot()
+            .saved_copies,
+        recorded,
+        "a read-only status reads the folder"
+    );
+    let workspace = Workspace::open(&root).unwrap();
+    assert_eq!(workspace.state.saved_copies.as_ref(), Some(&recorded));
 }

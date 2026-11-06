@@ -166,6 +166,23 @@ pub struct State<B = Vec<u8>> {
     /// Last AI-summary failure, already free of credentials and response bodies.
     #[serde(default)]
     pub summary_failure: Option<String>,
+    /// When a sync with the remote last succeeded. Rewritten at most once a
+    /// minute, so an idle workspace does not write its state every cycle.
+    #[serde(default)]
+    pub last_sync: Option<u64>,
+    /// Files Mesh moved to `.mesh/recovery/<id>/` before writing incoming
+    /// changes. `None`: never recorded, filled once from the folder on open.
+    #[serde(default)]
+    pub saved_copies: Option<Vec<SavedCopy>>,
+}
+
+/// A displaced file kept in `.mesh/recovery/<id>/content`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedCopy {
+    pub id: String,
+    /// The workspace-relative path the file was displaced from.
+    pub path: String,
+    pub created_at: u64,
 }
 
 pub fn binary(content: &Option<Vec<u8>>) -> bool {
