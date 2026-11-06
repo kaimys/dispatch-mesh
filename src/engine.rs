@@ -205,6 +205,8 @@ impl Workspace {
                     version: 1,
                     ..Default::default()
                 },
+                // Nothing was ever displaced in a new workspace.
+                saved_copies: Some(Vec::new()),
                 ..Default::default()
             },
             git,

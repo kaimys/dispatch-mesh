@@ -48,6 +48,8 @@ The top-level `status` is one workspace summary. When several apply, the first i
 
 For `needs_attention` and `offline`, `reason` names the cause; it never contains credentials, Git's raw error output, or provider response bodies. Each entry in `sessions` carries a `stage`: `saved_locally` → `draft_uploaded` → `waiting_for_finalization` → `published`, or `discarded`. Sessions received from other devices are uploaded by definition; a workspace without a remote has no upload stage. The raw `attention`, `offline`, `summary_failure`, `capture_error`, `local_changes_waiting`, and `recovery_pending` fields remain available. Earlier previews reported `waiting_to_sync`; that value no longer appears.
 
+Each session also reports `started_at` and `last_saved` (Unix seconds), `title` (the summary it was added to shared history with, `null` until then) and `purposes` (the requested purposes of its recorded intents). The workspace reports `has_remote`, `last_sync` (when a sync with the remote last succeeded, to the minute; `null` if never, and always `null` without a remote) and `saved_copies` (each displaced file's `id`, original `path` and `created_at`; the file is `.mesh/recovery/<id>/content`).
+
 Only one runner may own a workspace. A second `run`, or a second embedded engine, stops with "Mesh is already running for this workspace" and starts nothing; try again once the first one has stopped. Every other command keeps working while a runner is active.
 
 Desktop hosts embed the same run loop in-process through `dispatch_mesh::runner::Runner::start`. The returned handle publishes the `status` snapshot plus the runner's current capture, sync and summary errors whenever they change, and `stop()` saves local work without waiting for pending network or AI requests, just as Ctrl+C does for `run`. The tray host below is built on it; it is not yet a stable public API.
@@ -140,10 +142,12 @@ cargo build --release
 
 - Each `--workspace` must already be set up with `dispatch-mesh init`. Adding workspaces from the window comes with guided setup.
 - The icon shows the most urgent state of all workspaces: needs attention, offline, working (saved on this device, shared as draft, finishing up), or up to date. The tooltip names the state, and for attention and offline the reason. State is told apart by the icon's badge shape, not by color alone.
-- Left-click opens the status window: each workspace's name, folder and state, with the reason for attention or offline. With several workspaces, it lists the most urgent first.
+- Left-click opens the status window: each workspace's name, folder, state and last successful sync, with the reason for attention or offline. With several workspaces, it lists the most urgent first.
+- A workspace's recent activity lists every session still on its way plus the ten most recently settled, newest first: its stage track (saved on this device → shared as draft → finishing up → added to shared history), files, author, times, requested purpose and, once published, its summary title. Saved copies list each displaced file with **Show in folder**; restoring one stays a manual copy (see *Recovery procedures*).
+- **Finish session** in the window, and one menu item per workspace with an open session, closes the session just like `session finish`. A failed sync says that Mesh retries automatically.
 - Closing the window only hides it; Mesh keeps syncing. **Quit** in the right-click menu captures saved changes and stops, without waiting for the network, just like Ctrl+C for `run`.
 - If a CLI `run` or another tray already runs a workspace, the window says so and offers **Retry**; the other workspaces keep running. CLI commands such as `status`, `sync`, `session finish` and `intent` keep working while the tray runs.
-- Not yet: conflict review, session detail, presence, Finish session and pause, notifications other than a one-time hint after the first close, login startup and an installer. On Linux, building needs the WebKitGTK and AppIndicator development packages (see `.github/workflows/ci.yml`).
+- Not yet: conflict review, presence and pause, notifications other than a one-time hint after the first close, login startup and an installer. On Linux, building needs the WebKitGTK and AppIndicator development packages (see `.github/workflows/ci.yml`).
 
 ## Preview boundaries
 
@@ -162,7 +166,7 @@ cargo build --release
 - Same-file dependencies can delay permanent publication until upstream sessions finish. Draft ordering uses explicit dependencies and a stable timestamp/ID order for independent sessions; distributed conflict display policy is experimental.
 - Git network operations run on a separate worker and release the workspace operation lock while waiting on the remote. The worker reloads durable state before continuing, preserving edits captured during the request. One network cycle runs at a time; local merge/apply phases can still briefly hold the operation lock.
 - Connecting an existing Git checkout does not yet import its local history automatically. Use a fresh folder with the remote option for an existing shared repository. Manual Git interoperability is outside the initial supported workflow.
-- The tray host shows status only; conflict review, notifications, guided repository creation, bundled Git, installer, login startup, editor presence integration, and authenticated remote MCP are not available yet. CLI status and conflict commands expose the underlying engine operations for this milestone.
+- The tray host shows status and session detail and finishes sessions; conflict review, notifications, guided repository creation, bundled Git, installer, login startup, editor presence integration, and authenticated remote MCP are not available yet. CLI status and conflict commands expose the underlying engine operations for this milestone.
 
 ## Verification
 

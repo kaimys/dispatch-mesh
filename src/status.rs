@@ -264,10 +264,12 @@ impl Workspace {
     }
 }
 
-/// A session's requested purposes in the order they were recorded.
+/// A session's requested purposes in the order they were recorded. Intents
+/// carry whole seconds, so purposes recorded within one second are ordered by
+/// their text, never by their random ids.
 fn purposes(session: &Session) -> Vec<String> {
     let mut intents: Vec<_> = session.intents.values().collect();
-    intents.sort_by_key(|intent| intent.created_at);
+    intents.sort_by(|a, b| (a.created_at, &a.purpose).cmp(&(b.created_at, &b.purpose)));
     let mut purposes: Vec<String> = Vec::new();
     for intent in intents {
         if !purposes.contains(&intent.purpose) {

@@ -1630,12 +1630,30 @@ fn session_status_carries_times_purposes_and_the_published_title() {
         alice.end_intent(&intent).unwrap();
     }
     let id = alice.active_session().unwrap().id.clone();
+    // Intents carry whole seconds; give each its own so the recorded order shows.
+    let base = now() - 100;
+    for intent in alice
+        .state
+        .manifest
+        .sessions
+        .get_mut(&id)
+        .unwrap()
+        .intents
+        .values_mut()
+    {
+        intent.created_at = base + if intent.purpose == "Fix typos" { 0 } else { 10 };
+    }
+    alice.save().unwrap();
     let stored = alice.state.manifest.sessions[&id].clone();
     let status = alice.status_snapshot();
     let session = status.sessions.iter().find(|s| s.id == id).unwrap();
     assert_eq!(session.started_at, stored.created_at);
     assert_eq!(session.last_saved, stored.last_edit);
-    assert_eq!(session.purposes, ["Explain setup", "Fix typos"]);
+    assert_eq!(
+        session.purposes,
+        ["Fix typos", "Explain setup"],
+        "recorded order, without repeats"
+    );
     assert_eq!(session.title, None, "open sessions have no title");
 
     alice.sync().unwrap();
@@ -1643,7 +1661,7 @@ fn session_status_carries_times_purposes_and_the_published_title() {
     let received = bob.status_snapshot();
     let session = received.sessions.iter().find(|s| s.id == id).unwrap();
     assert_eq!(session.author.name, "Alice", "never the receiving user");
-    assert_eq!(session.purposes, ["Explain setup", "Fix typos"]);
+    assert_eq!(session.purposes, ["Fix typos", "Explain setup"]);
 
     finish(&mut alice);
     let status = alice.status_snapshot();

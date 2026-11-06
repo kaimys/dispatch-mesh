@@ -4,7 +4,7 @@
 
 Dispatch Mesh synchronizes folders through Git while hiding Git mechanics from end users. It tracks editing sessions, records agent intent, and preserves recoverable conflicts. Read `README.md` for the supported behavior and CLI examples before changing the engine.
 
-The current application is a Rust console preview plus a first Windows tray host in progress for 0.3 (status only). Conflict review and the rest of the tray controls, guided account/repository setup, bundled Git, and login startup are future work. macOS and Linux builds precede the authenticated cloud MCP milestone, which is deferred to version 2.0. Do not present planned features as implemented.
+The current application is a Rust console preview plus a first Windows tray host in progress for 0.3 (status, session detail and Finish session). Conflict review and the rest of the tray controls, guided account/repository setup, bundled Git, and login startup are future work. macOS and Linux builds precede the authenticated cloud MCP milestone, which is deferred to version 2.0. Do not present planned features as implemented.
 
 ## Repository map
 
