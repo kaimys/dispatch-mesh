@@ -32,6 +32,7 @@ The current application is a Rust console preview plus a first Windows tray host
 - Incoming changes must not become local authorship or reset the local inactivity timer. Preserve capture while network operations or AI requests are pending.
 - Never discard uncaptured edits or original conflict inputs. Preserve transaction boundaries, recovery journals, pending capture, and migration compatibility.
 - Conflict selections must survive publication order changes. Retain the contributing input revisions; reconcile later distinct edits separately. Unrelated files should continue synchronizing.
+- Ignore rules (`.gitignore`, `.ignore`, `.meshignore`) synchronize with the files. Every tree Mesh computes omits the paths its own rules exclude, and an excluded file is never written or deleted on disk; excluding a synchronized file records an attributed removal on `main` (ADR-0013).
 - Text uses clean three-way merging where possible. Binary conflicts select an entire competing file. Closed sessions with no effective changes must not produce empty permanent commits.
 - New metadata references native Git blobs or local SQLite BLOBs; do not embed file payloads as integer arrays in JSON. Referenced remote blobs must remain reachable and must be validated before use.
 - Recorded intent is the requested purpose, not evidence of completion. Scope it to the declared relative paths and include it locally in commit bodies even when AI fails. Mixed or unrelated edits must not inherit that purpose.

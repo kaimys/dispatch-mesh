@@ -15,7 +15,7 @@ cargo build --release
 ./target/release/dispatch-mesh.exe --workspace C:/MeshDemo run
 ```
 
-`init` creates the folder if necessary. Existing files become an editing session. Local-only workspaces work without a remote or an AI provider. Ctrl+C captures saved changes and stops; it does not require a last network request to complete.
+`init` creates the folder if necessary. Existing files become an editing session. In an Obsidian vault (a folder with `.obsidian/`), `init` also writes the per-device layout files `.obsidian/workspace.json` and `.obsidian/workspace-mobile.json` into `.meshignore`, adding only rules that are missing; the rest of `.obsidian/` keeps synchronizing. Local-only workspaces work without a remote or an AI provider. Ctrl+C captures saved changes and stops; it does not require a last network request to complete.
 
 To connect a repository, add `--remote <URL-or-local-bare-repository-path>` to `init`. Use a dedicated test repository and a fresh folder to join an existing remote. Git Credential Manager or SSH must already provide access in this preview; Mesh never asks for or saves a token in the remote URL. Mesh creates device branches under `mesh/devices/` and permanent session commits on `main` (or the branch selected with `--branch`). Do not manually change Mesh's private Git repository.
 
@@ -124,7 +124,7 @@ Run `status` first; `reason` tells you which case applies. Never delete `.mesh` 
 - **`needs_attention`, "Remote refused access".** Credentials or repository permissions are wrong. Fix the sign-in in Git Credential Manager or your SSH agent, confirm you can write the repository, then run `sync`.
 - **`needs_attention`, "Remote rejected the update".** Usually a publication race with another client. The next cycle fetches and retries; run `sync` if it does not clear.
 - **`needs_attention`, "Shared history was rewritten outside Mesh" or "The shared branch was deleted outside Mesh".** Someone changed `main` with Git directly. Mesh pauses synchronization and keeps local work. Restore the shared branch on the remote (it must contain the commits Mesh last saw), then run `sync`.
-- **`needs_attention`, "Local capture waiting: …".** A file could not be read or is unsupported (see *Preview boundaries*), for example a symlink, a case collision, or a path that became ignored after it was synchronized. Fix or restore the named file or ignore rule; no deletion is recorded meanwhile.
+- **`needs_attention`, "Local capture waiting: …".** A file could not be read or is unsupported (see *Preview boundaries*), for example a symlink or a case collision. Fix or restore the named file; no deletion is recorded meanwhile.
 - **`needs_attention`, pending-capture message ("Edits depend on a received draft …").** Run `session finish`. It checkpoints the current draft, and the dependent edits enter the next session.
 - **`needs_attention`, "AI summary failed: …".** Publication continues with a factual local message. Fix the API key, quota, or endpoint named in the message. The state clears with the next summary that does not fail, including one made after you remove the provider.
 - **Restoring a displaced file.** Open `.mesh/recovery/<id>/record.json` to find the original path, then copy `.mesh/recovery/<id>/content` back to that path (or anywhere else). The copy is an ordinary edit and enters a new session.
@@ -149,7 +149,15 @@ cargo build --release
 
 - Plain regular files with UTF-8 paths; binary contents are supported. Symlinks, reparse points, submodules, executable file modes, Windows reserved names, and case-colliding paths are unsupported.
 - Default maximum file size: 16 MiB, configurable in `.mesh/config.json`. Metadata references native Git blobs and deduplicated local SQLite BLOBs. Settled sessions and conflict inputs are retained, and reconstructing a device snapshot is bounded by a 128 MiB preview memory limit. Large-file storage, retention, and application-level cleanup remain future work.
-- `.mesh`, `.git`, `.env`, `.env.*`, `*.pem`, and `*.key` are excluded. `.gitignore` and `.meshignore` are honored. Use matching ignore policies on all clients; changing ignore rules for already synchronized files is not supported yet.
+- `.mesh`, `.git`, `.env`, `.env.*`, `*.pem`, and `*.key` are excluded. `.gitignore`, `.ignore` and `.meshignore` inside the workspace are honored. They synchronize like other files, so every device follows the same rules; rules from folders above the workspace are not part of them.
+- **Stop synchronizing a file** by adding a rule for it to `.meshignore`, even after it has been synchronized. The file stays on every device's disk. `main` records its removal, attributed to the device that added the rule, and later edits on any device stay local. A device that hasn't received the rule yet can still send edits; they are dropped, and an open conflict on the file is settled as "removed" with both inputs kept. Removing the rule again makes each device's copy an ordinary new change: identical copies merge, differing copies become an ordinary conflict. For an existing Obsidian vault, add these two lines to `.meshignore`:
+
+  ```
+  .obsidian/workspace.json
+  .obsidian/workspace-mobile.json
+  ```
+
+  **Update every device to 0.3.0 before adding such a rule.** Older versions treat the received removal as a deletion and move their local copy into `.mesh/recovery` (restore it as described under *Recovery procedures*).
 - Git credentials and commit identity are configured separately. This preview trusts collaborators authorized to write the remote repository; it does not implement cloud principal isolation or workspace permissions.
 - Same-file dependencies can delay permanent publication until upstream sessions finish. Draft ordering uses explicit dependencies and a stable timestamp/ID order for independent sessions; distributed conflict display policy is experimental.
 - Git network operations run on a separate worker and release the workspace operation lock while waiting on the remote. The worker reloads durable state before continuing, preserving edits captured during the request. One network cycle runs at a time; local merge/apply phases can still briefly hold the operation lock.
