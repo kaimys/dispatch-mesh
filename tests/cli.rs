@@ -503,3 +503,41 @@ fn failure_classification_does_not_depend_on_the_user_locale() {
     assert_offline(&status_after_failed_sync(&unreachable_remote(), GERMAN));
     assert_access_needs_attention(&status_after_failed_sync(&unauthorized_remote(), GERMAN));
 }
+
+#[test]
+fn init_in_an_obsidian_vault_excludes_only_the_per_device_layout() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(temp.path().join(".obsidian")).unwrap();
+    fs::write(temp.path().join(".obsidian/workspace.json"), "{}").unwrap();
+    fs::write(temp.path().join(".obsidian/app.json"), "{}").unwrap();
+    fs::write(temp.path().join("note.md"), "note").unwrap();
+    let mesh = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_dispatch-mesh"))
+            .arg("--workspace")
+            .arg(temp.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    mesh(&["init", "--name", "Alice", "--email", "alice@example.test"]);
+    mesh(&["session", "finish"]);
+    mesh(&["sync"]);
+    let status: serde_json::Value = serde_json::from_slice(&mesh(&["status"]).stdout).unwrap();
+    assert!(status["capture_error"].is_null(), "{status}");
+    assert_eq!(status["status"], "synced", "{status}");
+    assert_eq!(
+        fs::read_to_string(temp.path().join(".meshignore")).unwrap(),
+        ".obsidian/workspace.json\n.obsidian/workspace-mobile.json\n"
+    );
+    let workspace = Workspace::inspect(temp.path()).unwrap();
+    let shared = workspace.git.files(&workspace.state.main).unwrap();
+    assert!(shared.contains_key(".meshignore"));
+    assert!(shared.contains_key(".obsidian/app.json"));
+    assert!(!shared.contains_key(".obsidian/workspace.json"));
+}

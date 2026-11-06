@@ -200,7 +200,7 @@ Drafts synchronize continuously as internal snapshots. Files appear on GitHub's 
                 use ai::Summarizer;
                 let config = workspace.config.provider.clone().context("Configure a provider first")?;
                 let mut sample = Session { id: "connection-test".into(), device: "test".into(), author: workspace.config.identity.clone(), created_at: 0, last_edit: 0, revision: 1, closed: true, published: false,
-            discarded: false, changes: Default::default(), dependencies: Default::default(), intents: Default::default(), message: None, message_base: None };
+            discarded: false, changes: Default::default(), dependencies: Default::default(), intents: Default::default(), message: None, message_base: None, excluded: Default::default() };
                 sample.changes.insert("example.md".into(), Change { base: Some(b"Hello".to_vec()), content: Some(b"Hello, Mesh".to_vec()), intent: None, last_edit: now() });
                 drop(workspace);
                 let message = (ai::ChatCompletions { config }).summarize(&sample).await?;

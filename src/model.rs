@@ -84,6 +84,11 @@ pub struct Session<B = Vec<u8>> {
     pub message: Option<Message>,
     #[serde(default)]
     pub message_base: Option<String>,
+    /// Paths this session stops synchronizing because the rules now exclude them.
+    /// Filled only for the message preparation; never stored or transmitted, so
+    /// `snapshot_hash` and older engines see the same session.
+    #[serde(skip)]
+    pub excluded: BTreeSet<String>,
 }
 
 impl Session {

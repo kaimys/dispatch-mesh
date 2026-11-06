@@ -49,6 +49,7 @@ impl<A> Session<A> {
             intents: self.intents,
             message: self.message,
             message_base: self.message_base,
+            excluded: self.excluded,
         })
     }
 }

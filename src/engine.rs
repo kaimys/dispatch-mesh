@@ -1,6 +1,7 @@
 use crate::{
     git::{Git, validate_path},
     model::*,
+    policy::{self, Policy},
     storage, transport,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -173,6 +174,7 @@ impl Workspace {
         };
         workspace.save()?;
         workspace.save_config()?;
+        write_obsidian_excludes(&workspace.root)?;
         // Existing files become the first editing session, never an implicit overwrite.
         workspace.capture_at(now())?;
         Ok(workspace)
@@ -340,10 +342,14 @@ impl Workspace {
             );
             result.insert(path, bytes);
         }
+        // A synchronized path that the rules now exclude simply leaves the tree
+        // (ADR-0013). One that was skipped for any other reason is refused, so a
+        // walker/policy disagreement can never turn into a recorded deletion.
+        let policy = Policy::from_files(&self.root, &result)?;
         for path in self.state.observed.keys() {
             ensure!(
-                result.contains_key(path) || !self.root.join(path).exists(),
-                "A previously synchronized path is now ignored or unsupported: {path}. Restore the ignore policy before syncing; no deletion was recorded"
+                result.contains_key(path) || policy.ignores(path) || !self.root.join(path).exists(),
+                "A previously synchronized path is now unsupported: {path}. Restore the file before syncing; no deletion was recorded"
             );
         }
         Ok(result)
@@ -413,10 +419,12 @@ impl Workspace {
                 intents: BTreeMap::new(),
                 message: None,
                 message_base: None,
+                excluded: BTreeSet::new(),
             });
         session.revision += 1;
         session.last_edit = timestamp;
         let canonical = self.git.files(&self.state.main)?;
+        let policy = Policy::from_files(&self.root, &files)?;
         for path in changed {
             let intent = self
                 .state
@@ -428,7 +436,13 @@ impl Workspace {
             }
             let edited = files.get(&path).cloned();
             let observed = self.state.observed.get(&path).cloned();
-            if !session.changes.contains_key(&path) && observed.as_ref() != canonical.get(&path) {
+            // A synchronized file the rules now exclude: an explicit removal that
+            // stays on disk, never a merge against this session's pending edit.
+            let excluded = edited.is_none() && observed.is_some() && policy.ignores(&path);
+            if !excluded
+                && !session.changes.contains_key(&path)
+                && observed.as_ref() != canonical.get(&path)
+            {
                 let contributors: Vec<_> = self
                     .state
                     .manifest
@@ -449,7 +463,9 @@ impl Workspace {
                     session.dependencies.insert(contributor);
                 }
             }
-            let updated = if let Some(existing) = session.changes.get(&path) {
+            let updated = if excluded {
+                None
+            } else if let Some(existing) = session.changes.get(&path) {
                 // Apply only the new local delta to this author's own draft. Otherwise
                 // received peer text would be copied into the local author's commit.
                 match self.git.merge(&existing.content, &observed, &edited)? {
@@ -886,7 +902,13 @@ impl Workspace {
                 })
                 .context("Draft dependencies are missing or cyclic; local work retained")?;
             let session = pending.remove(index);
-            for (path, change) in &session.changes {
+            let mut policy = None;
+            for (path, change) in rules_first(&session) {
+                if excluded_by(&mut policy, &self.root, &files, path)? {
+                    // The removal wins over any edit to an excluded path (ADR-0013).
+                    files.remove(path);
+                    continue;
+                }
                 let accepted = files.get(path).cloned();
                 let discarded = self
                     .matching_resolution(path, change, &session)
@@ -906,7 +928,36 @@ impl Workspace {
             }
             applied.insert(session.id);
         }
+        let policy = Policy::from_files(&self.root, &files)?;
+        files.retain(|path, _| !policy.ignores(path));
+        self.settle_excluded_conflicts(&policy)?;
         self.install(files)
+    }
+
+    /// Recording that a path stopped synchronizing settles an open conflict on it,
+    /// as a traceable resolution selecting "removed" (ADR-0003). Both inputs stay
+    /// in the conflict record; the local file is never touched.
+    fn settle_excluded_conflicts(&mut self, policy: &Policy) -> Result<()> {
+        let ids: Vec<_> = self
+            .unresolved()
+            .filter(|conflict| policy.ignores(&conflict.path))
+            .map(|conflict| conflict.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        for id in ids {
+            self.state.manifest.resolutions.insert(
+                id.clone(),
+                Resolution {
+                    conflict: id,
+                    selected: None,
+                    author: self.config.identity.clone(),
+                    created_at: now(),
+                },
+            );
+        }
+        self.save()
     }
 
     fn merge_change(
@@ -1016,10 +1067,6 @@ impl Workspace {
                 folded.insert(path.to_lowercase()),
                 "Incoming files have case-colliding paths"
             );
-            ensure!(
-                !self.ignored(path)?,
-                "Incoming path is excluded by the local ignore policy: {path}. Synchronization paused without changing the file"
-            );
         }
         if desired == self.state.observed {
             return Ok(());
@@ -1036,56 +1083,22 @@ impl Workspace {
         self.recover_apply()
     }
 
-    fn ignored(&self, path: &str) -> Result<bool> {
-        let name = Path::new(path)
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or_default();
-        if name == ".env"
-            || name.starts_with(".env.")
-            || name.ends_with(".pem")
-            || name.ends_with(".key")
-        {
-            return Ok(true);
-        }
-        let target = self.root.join(path);
-        let mut directory = self.root.clone();
-        let mut ignored = false;
-        for part in std::iter::once(None).chain(
-            Path::new(path)
-                .parent()
-                .into_iter()
-                .flat_map(|p| p.components())
-                .map(Some),
-        ) {
-            if let Some(part) = part {
-                directory.push(part);
-            }
-            let mut builder = ignore::gitignore::GitignoreBuilder::new(&directory);
-            for name in [".gitignore", ".meshignore"] {
-                let file = directory.join(name);
-                if file.exists()
-                    && let Some(error) = builder.add(file)
-                {
-                    return Err(error.into());
-                }
-            }
-            let rules = builder.build()?;
-            let matched = rules.matched_path_or_any_parents(&target, false);
-            if !matched.is_none() {
-                ignored = matched.is_ignore();
-            }
-        }
-        Ok(ignored)
-    }
-
     fn recover_apply(&mut self) -> Result<()> {
         let Some(desired) = self.state.applying.clone() else {
             return Ok(());
         };
+        // Decided from the journal itself, so a replay after a crash leaves the same
+        // files alone. A path the incoming rules exclude is neither written nor
+        // removed, and leaves the observed view (ADR-0013).
+        let policy = Policy::from_files(&self.root, &desired)?;
+        let desired: Files = desired
+            .into_iter()
+            .filter(|(path, _)| !policy.ignores(path))
+            .collect();
         let paths: BTreeSet<_> = desired
             .keys()
             .chain(self.state.observed.keys())
+            .filter(|path| !policy.ignores(path))
             .cloned()
             .collect();
         let mut changed_by_user = false;
@@ -1229,20 +1242,27 @@ impl Workspace {
                 self.save()?;
                 continue;
             }
-            let mut files = self.git.files(&self.state.main)?;
+            let main = self.git.files(&self.state.main)?;
+            let mut files = main.clone();
             let conflicts_before = self.state.conflicts.len();
-            let mut effective_changes = false;
-            for (path, change) in &session.changes {
+            let mut policy = None;
+            for (path, change) in rules_first(&session) {
+                if excluded_by(&mut policy, &self.root, &files, path)? {
+                    files.remove(path);
+                    continue;
+                }
                 let accepted = files.get(path).cloned();
                 let merged = self.merge_change(path, &accepted, change, &session, None)?;
-                effective_changes |= merged != accepted;
                 set_file(&mut files, path, merged);
             }
+            // The shared tree never holds a path its own rules exclude (ADR-0013).
+            let policy = Policy::from_files(&self.root, &files)?;
+            files.retain(|path, _| !policy.ignores(path));
             if self.state.conflicts.len() != conflicts_before {
                 self.save()?;
                 continue;
             }
-            if !effective_changes {
+            if files == main {
                 self.discard_empty_projection(&id)?;
                 continue;
             }
@@ -1321,12 +1341,37 @@ impl Workspace {
         }
         let main = self.git.files(&self.state.main)?;
         let mut prepared = session.clone();
-        for (path, change) in &session.changes {
+        let mut tree = main.clone();
+        let mut policy = None;
+        for (path, change) in rules_first(&session) {
             let base = main.get(path).cloned();
-            let content = self.merge_change(path, &base, change, &session, None)?;
+            let content = if excluded_by(&mut policy, &self.root, &tree, path)? {
+                None
+            } else {
+                self.merge_change(path, &base, change, &session, None)?
+            };
+            set_file(&mut tree, path, content.clone());
             let entry = prepared.changes.get_mut(path).unwrap();
             entry.base = base;
             entry.content = content;
+        }
+        // Describe what publication will do: every path of main that the
+        // resulting rules exclude leaves the shared tree, and says so.
+        let policy = Policy::from_files(&self.root, &tree)?;
+        for (path, bytes) in &main {
+            if policy.ignores(path) {
+                prepared
+                    .changes
+                    .entry(path.clone())
+                    .or_insert_with(|| Change {
+                        base: Some(bytes.clone()),
+                        content: None,
+                        intent: None,
+                        last_edit: session.last_edit,
+                    })
+                    .content = None;
+                prepared.excluded.insert(path.clone());
+            }
         }
         if self
             .unresolved()
@@ -1379,6 +1424,68 @@ impl Workspace {
         self.save()?;
         self.render()
     }
+}
+
+/// Obsidian's per-device layout files. `init` writes them as visible, editable
+/// rules; nothing is built into the engine and existing workspaces are not edited.
+const OBSIDIAN_EXCLUDES: [&str; 2] = [
+    ".obsidian/workspace.json",
+    ".obsidian/workspace-mobile.json",
+];
+
+fn write_obsidian_excludes(root: &Path) -> Result<()> {
+    if !root.join(".obsidian").is_dir() {
+        return Ok(());
+    }
+    let path = root.join(".meshignore");
+    let mut text = match fs::read(&path) {
+        Ok(bytes) => String::from_utf8(bytes).context(".meshignore is not UTF-8 text")?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let missing: Vec<_> = OBSIDIAN_EXCLUDES
+        .into_iter()
+        .filter(|rule| !text.lines().any(|line| line.trim() == *rule))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    for rule in missing {
+        text.push_str(rule);
+        text.push('\n');
+    }
+    fs::write(&path, text)?;
+    Ok(())
+}
+
+/// A session's changes with the ignore-rule files first, so the rules a session
+/// brings decide which of its other paths the resulting tree may hold.
+fn rules_first(session: &Session) -> impl Iterator<Item = (&String, &Change)> {
+    let (rules, others): (Vec<_>, Vec<_>) = session
+        .changes
+        .iter()
+        .partition(|(path, _)| policy::is_rule_file(path));
+    rules.into_iter().chain(others)
+}
+
+/// Whether `path` is excluded by the rules of `files`, computing that policy
+/// once, on the first path that is not itself a rule file.
+fn excluded_by(
+    policy: &mut Option<Policy>,
+    root: &Path,
+    files: &Files,
+    path: &str,
+) -> Result<bool> {
+    if policy::is_rule_file(path) {
+        return Ok(false);
+    }
+    if policy.is_none() {
+        *policy = Some(Policy::from_files(root, files)?);
+    }
+    Ok(policy.as_ref().is_some_and(|policy| policy.ignores(path)))
 }
 
 fn set_file(files: &mut Files, path: &str, content: Option<Vec<u8>>) {

@@ -3,6 +3,7 @@ use dispatch_mesh::{
     engine::Workspace,
     git::{Git, validate_path},
     model::*,
+    policy::Policy,
 };
 use std::{collections::BTreeSet, fs, path::Path};
 use tempfile::TempDir;
@@ -311,17 +312,6 @@ fn journal_recovers_a_crash_after_displacing_the_old_file() {
     );
     assert_eq!(fs::read(backup.join("content")).unwrap(), b"before");
     assert!(workspace.state.applying.is_none());
-}
-
-#[test]
-fn changing_ignore_rules_does_not_publish_a_deletion_of_existing_content() {
-    let temp = TempDir::new().unwrap();
-    let mut workspace = init(temp.path(), "Alice", None);
-    fs::write(workspace.root.join("note.md"), "keep this").unwrap();
-    workspace.capture_at(now()).unwrap();
-    fs::write(workspace.root.join(".meshignore"), "note.md\n").unwrap();
-    assert!(workspace.capture_at(now()).is_err());
-    assert_eq!(workspace.state.observed["note.md"], b"keep this");
 }
 
 #[test]
@@ -929,4 +919,519 @@ fn a_failed_sync_records_its_cause_even_when_another_operation_holds_the_lock() 
     let alice = Workspace::open(&root).unwrap();
     assert!(alice.state.attention.is_none() && alice.state.offline.is_none());
     assert!(alice.status_snapshot().reason.is_none());
+}
+
+// US00003: excluding already synchronized files (ADR-0013).
+
+const LAYOUT: &str = ".obsidian/workspace.json";
+
+fn shared(workspace: &Workspace) -> Files {
+    workspace.git.files(&workspace.state.main).unwrap()
+}
+
+/// No tree on main holds a path its own ignore rules exclude.
+fn assert_main_respects_its_rules(workspace: &Workspace) {
+    let files = shared(workspace);
+    let policy = Policy::from_files(&workspace.root, &files).unwrap();
+    for path in files.keys() {
+        assert!(!policy.ignores(path), "main holds excluded {path}");
+    }
+}
+
+/// Publish every closed session of these devices, as the runner would over
+/// later cycles: close, sync, prepare the missing messages, sync again.
+fn settle(workspaces: &mut [&mut Workspace]) {
+    for _ in 0..4 {
+        for workspace in workspaces.iter_mut() {
+            workspace.finish().unwrap();
+            workspace.sync().unwrap();
+            let ids: Vec<_> = workspace
+                .state
+                .manifest
+                .sessions
+                .values()
+                .filter(|s| {
+                    s.device == workspace.config.device
+                        && s.closed
+                        && !s.settled()
+                        && s.message.is_none()
+                })
+                .map(|s| s.id.clone())
+                .collect();
+            for id in ids {
+                if let Some(input) = workspace.summary_input(&id).unwrap() {
+                    let session = workspace.state.manifest.sessions.get_mut(&id).unwrap();
+                    session.message = Some(ai::fallback(&input));
+                    session.message_base = input.message_base;
+                    workspace.save().unwrap();
+                }
+            }
+            workspace.sync().unwrap();
+        }
+    }
+}
+
+/// Two devices on one remote that both hold `LAYOUT` with `content`.
+fn two_devices_sharing_layout(temp: &TempDir, content: &str) -> (Workspace, Workspace) {
+    let origin = temp.path().join("remote.git");
+    remote(&origin);
+    let mut alice = init(&temp.path().join("alice"), "Alice", Some(&origin));
+    fs::create_dir_all(alice.root.join(".obsidian")).unwrap();
+    fs::write(alice.root.join(LAYOUT), content).unwrap();
+    fs::write(alice.root.join(".obsidian/app.json"), "{}").unwrap();
+    finish(&mut alice);
+    let mut bob = init(&temp.path().join("bob"), "Bob", Some(&origin));
+    bob.sync().unwrap();
+    assert_eq!(fs::read_to_string(bob.root.join(LAYOUT)).unwrap(), content);
+    (alice, bob)
+}
+
+fn exclude_layout(workspace: &Workspace) {
+    fs::write(workspace.root.join(".meshignore"), format!("{LAYOUT}\n")).unwrap();
+}
+
+#[test]
+fn excluding_a_synchronized_file_stops_syncing_it_without_deleting_it() {
+    let temp = TempDir::new().unwrap();
+    let mut workspace = init(temp.path(), "Alice", None);
+    fs::create_dir_all(workspace.root.join(".obsidian/plugins/dispatch")).unwrap();
+    fs::write(workspace.root.join(LAYOUT), "layout-1").unwrap();
+    fs::write(workspace.root.join(".obsidian/app.json"), "{}").unwrap();
+    fs::write(
+        workspace.root.join(".obsidian/plugins/dispatch/data.json"),
+        "{}",
+    )
+    .unwrap();
+    finish(&mut workspace);
+    assert!(shared(&workspace).contains_key(LAYOUT));
+
+    // AC 1: capture succeeds, the file stays, and main records an attributed
+    // removal in the same commit as the rule.
+    exclude_layout(&workspace);
+    assert!(workspace.capture_at(now()).unwrap());
+    finish(&mut workspace);
+    assert!(workspace.state.attention.is_none());
+    assert_eq!(
+        fs::read_to_string(workspace.root.join(LAYOUT)).unwrap(),
+        "layout-1"
+    );
+    let files = shared(&workspace);
+    assert!(!files.contains_key(LAYOUT));
+    assert!(files.contains_key(".meshignore"));
+    let main = workspace.state.main.clone();
+    let touched = workspace
+        .git
+        .text(&["diff-tree", "--no-commit-id", "--name-only", "-r", &main])
+        .unwrap();
+    assert!(
+        touched.lines().any(|line| line == ".meshignore"),
+        "{touched}"
+    );
+    assert!(touched.lines().any(|line| line == LAYOUT), "{touched}");
+    let author = workspace
+        .git
+        .text(&["log", "-1", "--format=%an", &main])
+        .unwrap();
+    assert_eq!(author.trim(), "Alice");
+    let message = workspace
+        .git
+        .text(&["log", "-1", "--format=%B", &main])
+        .unwrap();
+    assert!(
+        message.contains(&format!("Stopped synchronizing (now ignored): {LAYOUT}")),
+        "{message}"
+    );
+    assert!(
+        !message.contains(&format!("Deleted: {LAYOUT}")),
+        "{message}"
+    );
+    assert!(!workspace.state.observed.contains_key(LAYOUT));
+
+    // AC 2: later edits to the excluded file are not captured.
+    fs::write(workspace.root.join(LAYOUT), "layout-2").unwrap();
+    assert!(!workspace.capture_at(now()).unwrap());
+    assert!(workspace.active_session().is_none());
+
+    // AC 3: the rest of .obsidian/ keeps synchronizing.
+    fs::write(workspace.root.join(".obsidian/app.json"), "{\"a\":1}").unwrap();
+    fs::write(
+        workspace.root.join(".obsidian/plugins/dispatch/data.json"),
+        "{\"b\":1}",
+    )
+    .unwrap();
+    assert!(workspace.capture_at(now()).unwrap());
+    let changes = &workspace.active_session().unwrap().changes;
+    assert!(changes.contains_key(".obsidian/app.json"));
+    assert!(changes.contains_key(".obsidian/plugins/dispatch/data.json"));
+    finish(&mut workspace);
+    assert_eq!(shared(&workspace)[".obsidian/app.json"], b"{\"a\":1}");
+    assert_main_respects_its_rules(&workspace);
+}
+
+#[test]
+fn second_device_keeps_its_file_when_the_rule_arrives() {
+    let temp = TempDir::new().unwrap();
+    let (mut alice, mut bob) = two_devices_sharing_layout(&temp, "shared layout");
+    exclude_layout(&alice);
+    alice.sync().unwrap();
+    // The draft carrying the rule and the removal reaches Bob before it is final.
+    bob.sync().unwrap();
+    assert_eq!(
+        fs::read_to_string(bob.root.join(LAYOUT)).unwrap(),
+        "shared layout"
+    );
+    assert!(bob.state.attention.is_none());
+    finish(&mut alice);
+    bob.sync().unwrap();
+    assert_eq!(fs::read(bob.root.join(LAYOUT)).unwrap(), b"shared layout");
+    assert!(bob.state.attention.is_none());
+    assert!(!bob.state.observed.contains_key(LAYOUT));
+    assert!(!shared(&bob).contains_key(LAYOUT));
+    assert_eq!(
+        fs::read_to_string(bob.root.join(".meshignore")).unwrap(),
+        format!("{LAYOUT}\n")
+    );
+    fs::write(bob.root.join(LAYOUT), "layout of Bob").unwrap();
+    assert!(!bob.capture_at(now()).unwrap());
+    bob.sync().unwrap();
+    alice.sync().unwrap();
+    assert_eq!(
+        fs::read_to_string(alice.root.join(LAYOUT)).unwrap(),
+        "shared layout"
+    );
+    assert_main_respects_its_rules(&bob);
+}
+
+fn peer_edit_before_the_rule_arrives(bob_publishes_first: bool) {
+    let temp = TempDir::new().unwrap();
+    let (mut alice, mut bob) = two_devices_sharing_layout(&temp, "base");
+    fs::write(bob.root.join(LAYOUT), "bob layout").unwrap();
+    bob.sync().unwrap();
+    exclude_layout(&alice);
+    alice.sync().unwrap();
+    // AC 5: Alice receives the edit without a pause, a message or a conflict,
+    // and her file is untouched.
+    assert!(alice.state.attention.is_none());
+    assert!(alice.state.conflicts.values().all(|c| c.path != LAYOUT));
+    assert_eq!(fs::read_to_string(alice.root.join(LAYOUT)).unwrap(), "base");
+    if bob_publishes_first {
+        settle(&mut [&mut bob, &mut alice]);
+    } else {
+        settle(&mut [&mut alice, &mut bob]);
+    }
+    for workspace in [&alice, &bob] {
+        assert!(workspace.state.attention.is_none());
+        // The removal wins without a merge: no conflict is even recorded.
+        assert!(workspace.state.conflicts.values().all(|c| c.path != LAYOUT));
+        assert!(!shared(workspace).contains_key(LAYOUT));
+        assert!(
+            workspace
+                .state
+                .manifest
+                .sessions
+                .values()
+                .all(|s| s.settled())
+        );
+        assert_main_respects_its_rules(workspace);
+    }
+    assert_eq!(shared(&alice), shared(&bob));
+    assert_eq!(fs::read_to_string(alice.root.join(LAYOUT)).unwrap(), "base");
+    assert_eq!(
+        fs::read_to_string(bob.root.join(LAYOUT)).unwrap(),
+        "bob layout"
+    );
+}
+
+#[test]
+fn peer_edit_to_an_excluded_path_is_dropped_when_the_rule_publishes_first() {
+    peer_edit_before_the_rule_arrives(false);
+}
+
+#[test]
+fn peer_edit_to_an_excluded_path_is_dropped_when_the_edit_publishes_first() {
+    peer_edit_before_the_rule_arrives(true);
+}
+
+#[test]
+fn exclusion_replaces_a_pending_draft_edit() {
+    let temp = TempDir::new().unwrap();
+    let mut workspace = init(temp.path(), "Alice", None);
+    fs::create_dir_all(workspace.root.join(".obsidian")).unwrap();
+    fs::write(workspace.root.join(LAYOUT), "published").unwrap();
+    finish(&mut workspace);
+    fs::write(workspace.root.join(LAYOUT), "draft edit").unwrap();
+    workspace.capture_at(now()).unwrap();
+    assert!(
+        workspace
+            .active_session()
+            .unwrap()
+            .changes
+            .contains_key(LAYOUT)
+    );
+    exclude_layout(&workspace);
+    workspace.capture_at(now()).unwrap();
+    let change = &workspace.active_session().unwrap().changes[LAYOUT];
+    assert_eq!(change.base.as_deref(), Some(&b"published"[..]));
+    assert_eq!(change.content, None);
+    finish(&mut workspace);
+    assert!(!shared(&workspace).contains_key(LAYOUT));
+    let history = workspace
+        .git
+        .text(&["log", "-p", "--format=%H", &workspace.state.main])
+        .unwrap();
+    assert!(!history.contains("draft edit"));
+    assert_eq!(
+        fs::read_to_string(workspace.root.join(LAYOUT)).unwrap(),
+        "draft edit"
+    );
+}
+
+#[test]
+fn exclusion_settles_an_open_conflict_and_keeps_both_inputs() {
+    let temp = TempDir::new().unwrap();
+    let (mut alice, mut bob) = two_devices_sharing_layout(&temp, "base");
+    fs::write(alice.root.join(LAYOUT), "alice layout").unwrap();
+    fs::write(bob.root.join(LAYOUT), "bob layout").unwrap();
+    alice.sync().unwrap();
+    bob.sync().unwrap();
+    let conflict = bob
+        .unresolved()
+        .next()
+        .expect("concurrent layouts conflict")
+        .clone();
+    assert_eq!(conflict.path, LAYOUT);
+    let on_disk = fs::read(bob.root.join(LAYOUT)).unwrap();
+    exclude_layout(&bob);
+    bob.sync().unwrap();
+    // AC 7: settled as a traceable resolution that selects "removed".
+    let resolution = &bob.state.manifest.resolutions[&conflict.id];
+    assert_eq!(resolution.selected, None);
+    assert_eq!(resolution.author.name, "Bob");
+    let record = &bob.state.conflicts[&conflict.id];
+    assert_eq!(record.base, conflict.base);
+    assert_eq!(record.accepted, conflict.accepted);
+    assert_eq!(record.incoming, conflict.incoming);
+    assert!(bob.unresolved().next().is_none());
+    assert_eq!(fs::read(bob.root.join(LAYOUT)).unwrap(), on_disk);
+    settle(&mut [&mut bob, &mut alice]);
+    for workspace in [&alice, &bob] {
+        assert!(workspace.unresolved().next().is_none());
+        assert!(!shared(workspace).contains_key(LAYOUT));
+        assert!(workspace.state.attention.is_none());
+    }
+    assert_eq!(
+        fs::read_to_string(alice.root.join(LAYOUT)).unwrap(),
+        "alice layout"
+    );
+}
+
+/// Both devices exclude LAYOUT, then hold `alice_copy` / `bob_copy` locally.
+fn excluded_on_both(temp: &TempDir, alice_copy: &str, bob_copy: &str) -> (Workspace, Workspace) {
+    let (mut alice, mut bob) = two_devices_sharing_layout(temp, "base");
+    exclude_layout(&alice);
+    settle(&mut [&mut alice, &mut bob]);
+    fs::write(alice.root.join(LAYOUT), alice_copy).unwrap();
+    fs::write(bob.root.join(LAYOUT), bob_copy).unwrap();
+    settle(&mut [&mut alice, &mut bob]);
+    assert!(!shared(&alice).contains_key(LAYOUT));
+    assert!(!shared(&bob).contains_key(LAYOUT));
+    (alice, bob)
+}
+
+#[test]
+fn re_including_identical_copies_brings_the_file_back_without_conflict() {
+    let temp = TempDir::new().unwrap();
+    let (mut alice, mut bob) = excluded_on_both(&temp, "same", "same");
+    fs::write(alice.root.join(".meshignore"), "").unwrap();
+    settle(&mut [&mut alice, &mut bob]);
+    for workspace in [&alice, &bob] {
+        assert!(workspace.unresolved().next().is_none());
+        assert_eq!(shared(workspace)[LAYOUT], b"same");
+    }
+    assert_eq!(fs::read_to_string(bob.root.join(LAYOUT)).unwrap(), "same");
+}
+
+#[test]
+fn re_including_differing_copies_is_an_ordinary_conflict() {
+    let temp = TempDir::new().unwrap();
+    let (mut alice, mut bob) = excluded_on_both(&temp, "alice copy", "bob copy");
+    fs::write(alice.root.join(".meshignore"), "").unwrap();
+    alice.sync().unwrap();
+    bob.sync().unwrap();
+    alice.sync().unwrap();
+    // AC 9: neither file is overwritten; both versions are kept as conflict inputs.
+    assert_eq!(
+        fs::read_to_string(alice.root.join(LAYOUT)).unwrap(),
+        "alice copy"
+    );
+    assert_eq!(
+        fs::read_to_string(bob.root.join(LAYOUT)).unwrap(),
+        "bob copy"
+    );
+    let conflict = bob
+        .unresolved()
+        .chain(alice.unresolved())
+        .find(|c| c.path == LAYOUT)
+        .expect("differing copies conflict")
+        .clone();
+    let inputs = [conflict.accepted.clone(), conflict.incoming.clone()];
+    assert!(inputs.contains(&Some(b"alice copy".to_vec())));
+    assert!(inputs.contains(&Some(b"bob copy".to_vec())));
+}
+
+#[test]
+fn init_writes_the_obsidian_excludes_visibly() {
+    let rules = ".obsidian/workspace.json\n.obsidian/workspace-mobile.json\n";
+    // A fresh vault.
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join(".obsidian")).unwrap();
+    fs::write(temp.path().join(LAYOUT), "layout").unwrap();
+    fs::write(temp.path().join(".obsidian/app.json"), "{}").unwrap();
+    let workspace = init(temp.path(), "Alice", None);
+    assert_eq!(
+        fs::read_to_string(temp.path().join(".meshignore")).unwrap(),
+        rules
+    );
+    let session = workspace.active_session().unwrap();
+    assert!(session.changes.contains_key(".meshignore"));
+    assert!(session.changes.contains_key(".obsidian/app.json"));
+    assert!(!session.changes.contains_key(LAYOUT));
+
+    // An existing .meshignore keeps its content and gains only the missing rule.
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join(".obsidian")).unwrap();
+    fs::write(
+        temp.path().join(".meshignore"),
+        "private/\n.obsidian/workspace.json",
+    )
+    .unwrap();
+    init(temp.path(), "Alice", None);
+    assert_eq!(
+        fs::read_to_string(temp.path().join(".meshignore")).unwrap(),
+        format!("private/\n{rules}")
+    );
+
+    // Not an Obsidian vault: nothing is written.
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("note.md"), "note").unwrap();
+    init(temp.path(), "Alice", None);
+    assert!(!temp.path().join(".meshignore").exists());
+}
+
+#[test]
+fn existing_workspaces_are_never_given_rules_automatically() {
+    let temp = TempDir::new().unwrap();
+    let mut workspace = init(temp.path(), "Alice", None);
+    fs::create_dir_all(workspace.root.join(".obsidian")).unwrap();
+    fs::write(workspace.root.join(LAYOUT), "layout").unwrap();
+    finish(&mut workspace);
+    drop(workspace);
+    let mut workspace = Workspace::open(temp.path()).unwrap();
+    workspace.sync().unwrap();
+    assert!(!temp.path().join(".meshignore").exists());
+    assert!(shared(&workspace).contains_key(LAYOUT));
+}
+
+#[test]
+fn other_unsupported_paths_still_stop_capture() {
+    let temp = TempDir::new().unwrap();
+    let outer = temp.path().join("outer");
+    let mut workspace = init(&outer.join("vault"), "Alice", None);
+    fs::write(workspace.root.join("big.md"), "small").unwrap();
+    fs::write(workspace.root.join("note.md"), "note").unwrap();
+    finish(&mut workspace);
+
+    workspace.config.max_file_bytes = 8;
+    fs::write(workspace.root.join("big.md"), "now too large").unwrap();
+    let error = workspace.capture_at(now()).unwrap_err().to_string();
+    assert!(error.contains("size limit"), "{error}");
+    workspace.config.max_file_bytes = 1024;
+    fs::write(workspace.root.join("big.md"), "small").unwrap();
+
+    // A rule outside the workspace is not part of its policy: the walker skips
+    // the file and the policy doesn't, so capture refuses instead of recording a
+    // deletion.
+    fs::write(outer.join(".gitignore"), "note.md\n").unwrap();
+    let error = workspace.capture_at(now()).unwrap_err().to_string();
+    assert!(error.contains("now unsupported: note.md"), "{error}");
+    assert_eq!(workspace.state.observed["note.md"], b"note");
+}
+
+#[test]
+fn an_interrupted_apply_leaves_an_excluded_file_alone_on_recovery() {
+    let temp = TempDir::new().unwrap();
+    let mut workspace = init(temp.path(), "Alice", None);
+    fs::create_dir_all(workspace.root.join(".obsidian")).unwrap();
+    fs::write(workspace.root.join(LAYOUT), "layout").unwrap();
+    finish(&mut workspace);
+    // The journal of an apply that brings the rule and drops the path.
+    let mut desired = workspace.state.observed.clone();
+    desired.remove(LAYOUT);
+    desired.insert(".meshignore".into(), format!("{LAYOUT}\n").into_bytes());
+    workspace.state.applying = Some(desired);
+    workspace.save().unwrap();
+    drop(workspace);
+    let workspace = Workspace::open(temp.path()).unwrap();
+    assert!(workspace.state.applying.is_none());
+    assert_eq!(
+        fs::read_to_string(temp.path().join(LAYOUT)).unwrap(),
+        "layout"
+    );
+    assert!(temp.path().join(".meshignore").exists());
+    assert!(!workspace.state.observed.contains_key(LAYOUT));
+    let recovery = temp.path().join(".mesh/recovery");
+    assert!(!recovery.exists() || fs::read_dir(recovery).unwrap().next().is_none());
+}
+
+#[test]
+fn tree_policy_agrees_with_the_folder_walker() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let files: &[(&str, &str)] = &[
+        (".gitignore", "*.log\nbuild/\n/root-only.txt\n"),
+        (".ignore", "scratch.txt\n"),
+        (
+            ".meshignore",
+            "\u{feff}!keep.log\nsecret/\n# comment\nspaced.txt   \r\n",
+        ),
+        ("keep.log", "x"),
+        ("drop.log", "x"),
+        ("root-only.txt", "x"),
+        ("scratch.txt", "x"),
+        ("spaced.txt", "x"),
+        ("note.md", "x"),
+        ("build/out.md", "x"),
+        ("build/.gitignore", "!*\n"),
+        ("secret/a.md", "x"),
+        ("sub/.gitignore", "!*.log\nlocal.txt\n"),
+        ("sub/.meshignore", "x.md\n!local.txt\n"),
+        ("sub/a.log", "x"),
+        ("sub/x.md", "x"),
+        ("sub/local.txt", "x"),
+        ("sub/root-only.txt", "x"),
+        ("sub/deep/x.md", "x"),
+        ("sub/deep/.gitignore", "*.md\n"),
+        ("sub/deep/y.md", "x"),
+        ("sub/deep/z.txt", "x"),
+        ("docs/.env", "x"),
+        ("docs/id.key", "x"),
+        ("docs/readme.md", "x"),
+    ];
+    let mut tree = Files::new();
+    for (path, content) in files {
+        let target = root.join(path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, content).unwrap();
+        tree.insert(path.to_string(), content.as_bytes().to_vec());
+    }
+    let workspace = init(root, "Alice", None);
+    let walked = workspace.scan().unwrap();
+    let policy = Policy::from_files(&workspace.root, &tree).unwrap();
+    for (path, _) in files {
+        assert_eq!(
+            walked.contains_key(*path),
+            !policy.ignores(path),
+            "walker and policy disagree on {path}"
+        );
+    }
 }
