@@ -25,6 +25,8 @@ The current application is a Rust console preview plus a first Windows tray host
 
 `dispatch/wiki` is the project's Obsidian vault (product concept documents and tickets), synchronized by Mesh itself. It is ignored by this repository. Do not assume it is disposable or include it in source-repository commits.
 
+Write all new or modified wiki Markdown as UTF-8 without a BOM and with LF (`\n`) line endings, including appended log entries. Configure the writing tool explicitly so Windows does not translate LF to CRLF (for example, Python text writes with `encoding="utf-8", newline="\n"`, or byte writes). Before finishing, check the edited files for CRLF or mixed line endings. Do not normalize unrelated wiki files as part of a routine edit.
+
 ## Behavioral invariants
 
 - Drafts synchronize continuously on `mesh/devices/<device-id>`. Finalized sessions become permanent commits on `main` or the configured shared branch. Preserve immutable shared history; do not replace this with force-pushed amendments to shared commits.
