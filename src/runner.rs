@@ -8,7 +8,7 @@
 
 use crate::{
     ai,
-    engine::{Workspace, WorkspaceBusy},
+    engine::{DependentEditsPreserved, Workspace, WorkspaceBusy},
     model::{Files, now},
     status::{LocalObservation, Status},
 };
@@ -269,6 +269,9 @@ pub async fn run(
                         snapshot = status;
                         if capture_error.take().is_some() { println!("Local capture resumed."); }
                     },
+                    // Capture recorded the reason in workspace attention, where
+                    // status shows it with what resolves it; it is no capture fault.
+                    Err(error) if error.is::<DependentEditsPreserved>() => { pending_scan = true; capture_error = None; },
                     Err(error) => { pending_scan = true; report_failure("Capture waiting", &error, &mut capture_error); },
                 }
                 if let Some(sender) = &status {

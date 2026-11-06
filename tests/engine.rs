@@ -1880,3 +1880,50 @@ fn a_legacy_record_without_content_is_not_backfilled() {
     assert_eq!(assert_copies_exist(&root), real);
     assert!(empty.join("record.json").is_file(), "left in place");
 }
+
+/// Alice's open session and Bob's received draft both changed `note.md`;
+/// Alice's next save edits the line Bob changed. Returns Alice's root.
+fn edit_depending_on_a_received_draft(temp: &TempDir) -> std::path::PathBuf {
+    let origin = temp.path().join("remote.git");
+    remote(&origin);
+    let mut alice = init(&temp.path().join("alice"), "Alice", Some(&origin));
+    let mut bob = init(&temp.path().join("bob"), "Bob", Some(&origin));
+    fs::write(alice.root.join("note.md"), "a\nb\nc\n").unwrap();
+    finish(&mut alice);
+    bob.sync().unwrap();
+    fs::write(alice.root.join("note.md"), "a\nb\nc1\n").unwrap();
+    alice.sync().unwrap();
+    fs::write(bob.root.join("note.md"), "A\nb\nc\n").unwrap();
+    bob.sync().unwrap();
+    alice.sync().unwrap();
+    assert_eq!(
+        fs::read_to_string(alice.root.join("note.md")).unwrap(),
+        "A\nb\nc1\n"
+    );
+    fs::write(alice.root.join("note.md"), "Z\nb\nc1\n").unwrap();
+    alice.root.clone()
+}
+
+#[test]
+fn a_sync_failure_keeps_the_dependent_edits_reason_and_its_remedy() {
+    use dispatch_mesh::engine::{DependentEditsPreserved, RECEIVED_DRAFT_DEPENDENCY};
+    let temp = TempDir::new().unwrap();
+    let root = edit_depending_on_a_received_draft(&temp);
+    let error = Workspace::sync_and_record(&root).unwrap_err();
+    assert!(error.is::<DependentEditsPreserved>(), "{error:#}");
+    let status = Workspace::inspect(&root).unwrap().status_snapshot();
+    let reason = status.reason.unwrap_or_default();
+    assert!(
+        reason.starts_with(RECEIVED_DRAFT_DEPENDENCY),
+        "not replaced by a sync failure: {reason}"
+    );
+    assert!(
+        status.active_session.is_some(),
+        "Finish session resolves it"
+    );
+
+    // Finishing checkpoints the draft; the dependent edits enter the next session.
+    let mut workspace = Workspace::open(&root).unwrap();
+    workspace.finish().unwrap();
+    assert!(workspace.state.pending_capture.is_none());
+}

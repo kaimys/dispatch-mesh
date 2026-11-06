@@ -564,3 +564,80 @@ fn a_failing_provider_never_exposes_the_api_key_in_status() {
     let _ = child.wait();
     assert!(!stderr.contains(key), "{stderr}");
 }
+
+#[test]
+fn edits_depending_on_a_received_draft_show_their_reason_not_a_capture_fault() {
+    use dispatch_mesh::{ai, engine::RECEIVED_DRAFT_DEPENDENCY, git::Git};
+    let temp = tempfile::tempdir().unwrap();
+    let origin = temp.path().join("remote.git");
+    Git {
+        dir: origin.clone(),
+    }
+    .init()
+    .unwrap();
+    let workspace = |name: &str| {
+        let root = temp.path().join(name);
+        std::fs::create_dir(&root).unwrap();
+        Workspace::init(
+            &root,
+            Identity {
+                name: name.into(),
+                email: format!("{name}@example.test"),
+            },
+            Some(origin.display().to_string()),
+            "main".into(),
+        )
+        .unwrap()
+    };
+    let mut alice = workspace("alice");
+    let mut bob = workspace("bob");
+    std::fs::write(alice.root.join("note.md"), "a\nb\nc\n").unwrap();
+    let id = alice.finish().unwrap().unwrap();
+    alice.sync().unwrap();
+    let input = alice.summary_input(&id).unwrap().unwrap();
+    let session = alice.state.manifest.sessions.get_mut(&id).unwrap();
+    session.message = Some(ai::fallback(&input));
+    session.message_base = input.message_base;
+    alice.save().unwrap();
+    alice.sync().unwrap();
+    bob.sync().unwrap();
+    std::fs::write(alice.root.join("note.md"), "a\nb\nc1\n").unwrap();
+    alice.sync().unwrap();
+    std::fs::write(bob.root.join("note.md"), "A\nb\nc\n").unwrap();
+    bob.sync().unwrap();
+    alice.sync().unwrap();
+    let root = alice.root.clone();
+    drop(alice);
+
+    let runner = Runner::start(&root).unwrap();
+    let mut status = runner.status();
+    wait_for(&mut status, Duration::from_secs(15), |s| {
+        s.status.active_session.is_some()
+    });
+    std::fs::write(root.join("note.md"), "Z\nb\nc1\n").unwrap();
+    let snapshot = wait_for(&mut status, Duration::from_secs(30), |s| {
+        s.status.reason.is_some()
+    });
+    let reason = snapshot.status.reason.clone().unwrap();
+    assert!(
+        reason.starts_with(RECEIVED_DRAFT_DEPENDENCY),
+        "{reason}; {snapshot:#?}"
+    );
+    assert_eq!(snapshot.capture_error, None);
+    // It stays that way across further capture and sync cycles.
+    std::thread::sleep(Duration::from_secs(8));
+    let later = status.borrow().clone().unwrap();
+    assert!(
+        later
+            .status
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with(RECEIVED_DRAFT_DEPENDENCY)),
+        "{later:#?}"
+    );
+    runner.stop();
+    // The final capture reports the same preserved edits; the bytes stay in
+    // pending capture for the next session either way.
+    let _ = runner.join();
+    assert!(open(&root).state.pending_capture.is_some());
+}

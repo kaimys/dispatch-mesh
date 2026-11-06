@@ -37,6 +37,23 @@ impl std::fmt::Display for WorkspaceBusy {
 
 impl std::error::Error for WorkspaceBusy {}
 
+/// Capture kept saved bytes aside because they cannot be attributed safely,
+/// and recorded why in `attention`. That recorded reason is the one to show:
+/// retrying cannot clear it, only finishing the current session can.
+#[derive(Debug)]
+pub struct DependentEditsPreserved;
+
+impl std::fmt::Display for DependentEditsPreserved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Dependent edits preserved; finish the current session before continuing synchronization"
+        )
+    }
+}
+
+impl std::error::Error for DependentEditsPreserved {}
+
 /// How long a lock attempt keeps retrying before reporting `WorkspaceBusy`.
 ///
 /// On Unix these are `flock` locks, which belong to the open file description.
@@ -527,9 +544,7 @@ impl Workspace {
                         self.state.pending_capture = Some(files.clone());
                         self.state.attention = Some("Dependent edits are saved locally. Finish the current session to avoid a circular draft dependency.".into());
                         self.save()?;
-                        bail!(
-                            "Dependent edits preserved; finish the current session before continuing synchronization"
-                        );
+                        return Err(DependentEditsPreserved.into());
                     }
                     session.dependencies.insert(contributor);
                 }
@@ -547,9 +562,7 @@ impl Workspace {
                             "{RECEIVED_DRAFT_DEPENDENCY} and cannot be attributed safely. Bytes are saved locally. Use session finish to checkpoint the current draft; the dependent edits will enter the next session."
                         ));
                         self.save()?;
-                        bail!(
-                            "Dependent edits preserved; finish the current session before continuing synchronization"
-                        );
+                        return Err(DependentEditsPreserved.into());
                     }
                 }
             } else {
@@ -926,6 +939,10 @@ impl Workspace {
     /// Record why a sync failed. An unreachable remote is `offline`; every other
     /// failure, including unclassified ones, needs the user's attention (ADR-0010).
     pub fn record_sync_failure(&mut self, error: &anyhow::Error) {
+        if error.is::<DependentEditsPreserved>() {
+            // Capture already recorded the reason and what resolves it.
+            return;
+        }
         let message = format!("{error:#}");
         if crate::git::failure_kind(error) == Some(crate::git::GitFailureKind::Offline) {
             // Replace a previous sync failure, but keep engine-raised attention.
