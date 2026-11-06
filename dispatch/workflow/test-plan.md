@@ -27,7 +27,7 @@ Writes the manual test plan and performs the `In progress` → `Review` transiti
 ## Write the plan
 
 6. Replace the spec's `## Test plan` section (record zone) and strip its `<!-- GUIDE: … -->`. Structure: one line naming the change and the build it applies to, then a `- [ ]` checklist of what step 5 left. **Every item must be executable by someone without this session's context** — concrete starting point, concrete action, concrete expected result. "Check the settings screen works" is not an item. Assign a tester with a bold prefix (`**Name:**`) where it matters.
-7. Set `open_tests:` to the number of checklist items. It is the `✓ N` badge and the gate out of review: reviewers tick items and decrement it, `0` means manual review is complete.
+7. Set `open_tests:` to the number of checklist items. It is the `✓ N` badge and the gate out of review: reviewers tick items and decrement it, `0` means manual review is complete. This plan is the story's only one (`dispatch/invariants.md`, *One code review and one test plan per story*): a check that fails is fixed, recorded as dated entries, run again on the fixed build and ticked once it passes. The fix resets no counter and moves no status, so the ticket stays in `Review`. If the ticket already has a test plan and a `frozen:` stamp, say so and stop.
 
 ## Freeze and move
 
