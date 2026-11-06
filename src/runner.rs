@@ -112,7 +112,7 @@ pub type StatusSender = watch::Sender<Option<RunnerSnapshot>>;
 /// Summarize this device's closed sessions that have no message yet and
 /// persist the latest provider outcome (ADR-0005, ADR-0010).
 pub async fn summarize_ready(root: &Path) -> Result<()> {
-    let mut workspace = Workspace::open(root)?;
+    let mut workspace = open_when_free(root).await?;
     let config = workspace.config.clone();
     let ids: Vec<_> = workspace
         .state
@@ -132,7 +132,8 @@ pub async fn summarize_ready(root: &Path) -> Result<()> {
     drop(workspace);
     for (session, hash) in sessions {
         let (message, failure) = ai::generate_with_failure(&config, &session).await;
-        let mut workspace = Workspace::open(root)?;
+        // The answer is already paid for: wait for the workspace rather than drop it.
+        let mut workspace = open_when_free(root).await?;
         // Persist the latest provider outcome so `status` can explain it (ADR-0010).
         if workspace.state.summary_failure != failure {
             workspace.state.summary_failure = failure;
@@ -150,6 +151,25 @@ pub async fn summarize_ready(root: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// How long the summary step waits for a busy workspace. Sync and capture can
+/// hold the operation lock for seconds in a large workspace (BUG00001); the
+/// tray's Finish session waits as long.
+const SUMMARY_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// Open the workspace, waiting while another operation holds it. Waits between
+/// attempts without blocking the runner's loop.
+async fn open_when_free(root: &Path) -> Result<Workspace> {
+    let started = Instant::now();
+    loop {
+        match Workspace::open(root) {
+            Err(error) if error.is::<WorkspaceBusy>() && started.elapsed() < SUMMARY_LOCK_WAIT => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            result => return result,
+        }
+    }
 }
 
 fn report_failure(label: &str, error: &anyhow::Error, previous: &mut Option<(String, Instant)>) {

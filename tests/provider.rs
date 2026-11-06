@@ -7,7 +7,9 @@ use serde_json::{Value, json};
 use std::{
     io::{Read, Write},
     net::TcpListener,
+    path::{Path, PathBuf},
     sync::mpsc,
+    time::Duration,
 };
 
 fn serve(content: &str) -> (String, mpsc::Receiver<Value>, std::thread::JoinHandle<()>) {
@@ -37,9 +39,23 @@ fn serve_responses(
     let (sender, receiver) = mpsc::channel();
     let thread = std::thread::spawn(move || {
         for _ in 0..connections {
-            respond(&listener, status, &extra, &body, &sender);
+            respond(&listener, status, &extra, &body, &sender, Duration::ZERO);
         }
     });
+    (url, receiver, thread)
+}
+
+/// Answer one request with `content` as the message, `delay` after receiving it.
+/// The request is reported on the channel before the delay starts.
+fn serve_delayed(
+    content: &str,
+    delay: Duration,
+) -> (String, mpsc::Receiver<Value>, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let body = json!({"choices": [{"message": {"content": content}}]}).to_string();
+    let (sender, receiver) = mpsc::channel();
+    let thread = std::thread::spawn(move || respond(&listener, 200, "", &body, &sender, delay));
     (url, receiver, thread)
 }
 
@@ -49,6 +65,7 @@ fn respond(
     extra: &str,
     body: &str,
     sender: &mpsc::Sender<Value>,
+    delay: Duration,
 ) {
     {
         let (mut stream, _) = listener.accept().unwrap();
@@ -84,6 +101,7 @@ fn respond(
         sender
             .send(serde_json::from_slice(&request[header_end..header_end + length]).unwrap())
             .unwrap();
+        std::thread::sleep(delay);
         write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
     }
 }
@@ -845,4 +863,95 @@ async fn excluded_files_are_described_without_their_text_even_when_text_sharing_
     assert_eq!(edited["content_available"], true);
     assert_eq!(edited["after"], "confidential sample text");
     thread.join().unwrap();
+}
+
+/// A local-only workspace with one closed session waiting for its summary,
+/// summarized by the mock provider at `url`.
+fn closed_session_with_provider(temp: &Path, url: String) -> (PathBuf, String) {
+    let mut workspace = Workspace::init(
+        temp,
+        Identity {
+            name: "Alice".into(),
+            email: "alice@example.test".into(),
+        },
+        None,
+        "main".into(),
+    )
+    .unwrap();
+    workspace.config.provider = Some(ProviderConfig {
+        base_url: url,
+        model: "test".into(),
+        api_key_env: None,
+        json_mode: true,
+        send_text: true,
+    });
+    workspace.save_config().unwrap();
+    std::fs::write(temp.join("guide.md"), "setup steps").unwrap();
+    let id = workspace.finish().unwrap().unwrap();
+    (workspace.root.clone(), id)
+}
+
+/// Hold the workspace's operation lock for `duration` on another thread; returns
+/// once the lock is held.
+fn hold_lock(root: &Path, duration: Duration) -> std::thread::JoinHandle<()> {
+    let (held, is_held) = mpsc::channel();
+    let root = root.to_path_buf();
+    let thread = std::thread::spawn(move || {
+        let workspace = Workspace::open(&root).unwrap();
+        held.send(()).unwrap();
+        std::thread::sleep(duration);
+        drop(workspace);
+    });
+    is_held.recv().unwrap();
+    thread
+}
+
+fn message(root: &Path, id: &str) -> Option<Message> {
+    Workspace::inspect(root).unwrap().state.manifest.sessions[id]
+        .message
+        .clone()
+}
+
+// BUG00001: the summary step must wait for a busy workspace, not give up after
+// one 0.5 s attempt and leave the session in Finishing up.
+#[tokio::test]
+async fn a_summary_waits_for_a_workspace_busy_when_it_starts() {
+    let temp = tempfile::tempdir().unwrap();
+    let (url, requests, server) =
+        serve(r#"{"title":"Explain setup","description":"Adds setup steps."}"#);
+    let (root, id) = closed_session_with_provider(temp.path(), url);
+    let holder = hold_lock(&root, Duration::from_millis(1500));
+    dispatch_mesh::runner::summarize_ready(&root).await.unwrap();
+    holder.join().unwrap();
+    server.join().unwrap();
+    assert_eq!(message(&root, &id).unwrap().title, "Explain setup");
+    assert_eq!(requests.try_iter().count(), 1);
+}
+
+#[tokio::test]
+async fn an_answer_that_arrives_while_the_workspace_is_busy_is_kept() {
+    let temp = tempfile::tempdir().unwrap();
+    let (url, requests, server) = serve_delayed(
+        r#"{"title":"Explain setup","description":"Adds setup steps."}"#,
+        Duration::from_millis(500),
+    );
+    let (root, id) = closed_session_with_provider(temp.path(), url);
+    let summary = tokio::spawn({
+        let root = root.clone();
+        async move { dispatch_mesh::runner::summarize_ready(&root).await }
+    });
+    // Take the lock while the provider is still answering, and keep it well
+    // past the answer: the answer arrives while the workspace is busy.
+    let request = tokio::task::spawn_blocking(move || {
+        requests.recv().unwrap();
+        requests
+    })
+    .await
+    .unwrap();
+    let holder = hold_lock(&root, Duration::from_millis(2000));
+    summary.await.unwrap().unwrap();
+    holder.join().unwrap();
+    server.join().unwrap();
+    assert_eq!(message(&root, &id).unwrap().title, "Explain setup");
+    assert_eq!(request.try_iter().count(), 0, "no second AI request");
 }
