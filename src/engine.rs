@@ -287,6 +287,7 @@ impl Workspace {
             .add("!*.pem")?
             .add("!*.key")?
             .build()?;
+        let mut visited = Vec::new();
         for entry in ignore::WalkBuilder::new(&self.root)
             .hidden(false)
             .follow_links(false)
@@ -300,47 +301,28 @@ impl Workspace {
         {
             let entry = entry.context("Cannot inspect workspace; snapshot was not advanced")?;
             if entry.depth() == 0 || entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                visited.push(entry.into_path());
                 continue;
             }
-            ensure!(
-                !entry.file_type().is_some_and(|kind| kind.is_symlink()),
-                "Symbolic links are unsupported in this preview: {}",
-                entry.path().display()
-            );
-            let path = entry
-                .path()
-                .strip_prefix(&self.root)?
-                .to_str()
-                .context("Non-UTF8 filename")?
-                .replace('\\', "/");
-            validate_path(&path)?;
-            ensure!(
-                folded.insert(path.to_lowercase()),
-                "Case-colliding paths are unsupported"
-            );
-            let before = fs::metadata(entry.path())?;
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::MetadataExt;
-                ensure!(
-                    before.file_attributes() & 0x400 == 0,
-                    "Reparse points are unsupported"
-                );
-            }
-            ensure!(
-                before.is_file() && before.len() <= self.config.max_file_bytes,
-                "File exceeds the configured size limit or is not a regular file: {path}"
-            );
-            let bytes = fs::read(entry.path())
-                .with_context(|| format!("Cannot read {path}; previous snapshot retained"))?;
-            let after = fs::metadata(entry.path())?;
-            ensure!(
-                before.len() == after.len()
-                    && before.modified()? == after.modified()?
-                    && bytes.len() as u64 == after.len(),
-                "File changed while being read; retrying on the next scan"
-            );
+            let path = self.relative(entry.path())?;
+            let bytes = self.read_supported(entry.path(), &path, &mut folded)?;
             result.insert(path, bytes);
+        }
+        // Rule files always belong to the tree, even when a rule matches them
+        // (ADR-0013): the walker applies them, so the shared policy must hold them.
+        for directory in visited {
+            for name in policy::RULE_FILES {
+                let file = directory.join(name);
+                let path = self.relative(&file)?;
+                if result.contains_key(&path)
+                    || policy::fixed_exclude(&path)
+                    || fs::symlink_metadata(&file).is_err()
+                {
+                    continue;
+                }
+                let bytes = self.read_supported(&file, &path, &mut folded)?;
+                result.insert(path, bytes);
+            }
         }
         // A synchronized path that the rules now exclude simply leaves the tree
         // (ADR-0013). One that was skipped for any other reason is refused, so a
@@ -353,6 +335,45 @@ impl Workspace {
             );
         }
         Ok(result)
+    }
+
+    fn relative(&self, file: &Path) -> Result<String> {
+        Ok(file
+            .strip_prefix(&self.root)?
+            .to_str()
+            .context("Non-UTF8 filename")?
+            .replace('\\', "/"))
+    }
+
+    /// Reads one workspace file, refusing what this preview doesn't support
+    /// without following a link or reparse point.
+    fn read_supported(
+        &self,
+        file: &Path,
+        path: &str,
+        folded: &mut BTreeSet<String>,
+    ) -> Result<Vec<u8>> {
+        ensure_regular_file(file)?;
+        validate_path(path)?;
+        ensure!(
+            folded.insert(path.to_lowercase()),
+            "Case-colliding paths are unsupported"
+        );
+        let before = fs::metadata(file)?;
+        ensure!(
+            before.is_file() && before.len() <= self.config.max_file_bytes,
+            "File exceeds the configured size limit or is not a regular file: {path}"
+        );
+        let bytes = fs::read(file)
+            .with_context(|| format!("Cannot read {path}; previous snapshot retained"))?;
+        let after = fs::metadata(file)?;
+        ensure!(
+            before.len() == after.len()
+                && before.modified()? == after.modified()?
+                && bytes.len() as u64 == after.len(),
+            "File changed while being read; retrying on the next scan"
+        );
+        Ok(bytes)
     }
 
     pub fn active_session(&self) -> Option<&Session> {
@@ -1438,8 +1459,13 @@ fn write_obsidian_excludes(root: &Path) -> Result<()> {
         return Ok(());
     }
     let path = root.join(".meshignore");
-    let mut text = match fs::read(&path) {
-        Ok(bytes) => String::from_utf8(bytes).context(".meshignore is not UTF-8 text")?,
+    // Check before reading or writing: a linked .meshignore must not let init
+    // change a file outside the workspace, even though capture rejects it later.
+    let mut text = match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            ensure_regular_file(&path)?;
+            String::from_utf8(fs::read(&path)?).context(".meshignore is not UTF-8 text")?
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e.into()),
     };
@@ -1457,7 +1483,31 @@ fn write_obsidian_excludes(root: &Path) -> Result<()> {
         text.push_str(rule);
         text.push('\n');
     }
-    fs::write(&path, text)?;
+    // Replace by rename: a link substituted after the check is replaced, not followed.
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new_in(root)?;
+    file.write_all(text.as_bytes())?;
+    file.as_file().sync_all()?;
+    file.persist(&path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// Refuses symbolic links and Windows reparse points without following them.
+fn ensure_regular_file(file: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(file)?;
+    ensure!(
+        !meta.file_type().is_symlink(),
+        "Symbolic links are unsupported in this preview: {}",
+        file.display()
+    );
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        ensure!(
+            meta.file_attributes() & 0x400 == 0,
+            "Reparse points are unsupported"
+        );
+    }
     Ok(())
 }
 

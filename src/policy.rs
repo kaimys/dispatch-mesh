@@ -13,7 +13,7 @@ use std::{
 
 /// Rule files in the precedence order of the folder walker: a match in a later
 /// kind wins over any match in an earlier one, whatever the directory depth.
-const RULE_FILES: [&str; 3] = [".gitignore", ".ignore", ".meshignore"];
+pub const RULE_FILES: [&str; 3] = [".gitignore", ".ignore", ".meshignore"];
 
 pub fn is_rule_file(path: &str) -> bool {
     RULE_FILES.contains(&path.rsplit('/').next().unwrap_or_default())
@@ -76,15 +76,22 @@ impl Policy {
         })
     }
 
-    /// Whether the folder walker would skip `path`: a fixed exclude, an ignored
-    /// file, or a file inside an ignored directory. Like the walker, a `!` rule
-    /// cannot re-include a file whose directory is ignored.
+    /// Whether the tree may not hold `path`: a fixed exclude, an ignored file, or
+    /// a file inside an ignored directory. Like the walker, a `!` rule cannot
+    /// re-include a file whose directory is ignored. A rule file is never ignored
+    /// by a rule that matches the file itself (ADR-0013).
     pub fn ignores(&self, path: &str) -> bool {
         if fixed_exclude(path) {
             return true;
         }
         let parts: Vec<_> = path.split('/').collect();
-        for depth in 1..=parts.len() {
+        // A rule file always belongs to the tree; only its folders can exclude it.
+        let last = if is_rule_file(path) {
+            parts.len() - 1
+        } else {
+            parts.len()
+        };
+        for depth in 1..=last {
             let candidate = self.root.join(parts[..depth].join("/"));
             let is_dir = depth < parts.len();
             let mut kinds = [None; 3];

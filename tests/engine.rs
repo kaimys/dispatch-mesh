@@ -1388,7 +1388,10 @@ fn tree_policy_agrees_with_the_folder_walker() {
     let temp = TempDir::new().unwrap();
     let root = temp.path();
     let files: &[(&str, &str)] = &[
-        (".gitignore", "*.log\nbuild/\n/root-only.txt\n"),
+        (
+            ".gitignore",
+            "*.log\nbuild/\n/root-only.txt\nrules/.meshignore\n",
+        ),
         (".ignore", "scratch.txt\n"),
         (
             ".meshignore",
@@ -1413,6 +1416,13 @@ fn tree_policy_agrees_with_the_folder_walker() {
         ("sub/deep/.gitignore", "*.md\n"),
         ("sub/deep/y.md", "x"),
         ("sub/deep/z.txt", "x"),
+        // F2: rule files matched by a rule, or by themselves, still belong to the tree.
+        ("rules/.meshignore", "r.md\n"),
+        ("rules/r.md", "x"),
+        ("rules/s.md", "x"),
+        ("other/.gitignore", ".gitignore\nz.md\n"),
+        ("other/z.md", "x"),
+        ("other/y.md", "x"),
         ("docs/.env", "x"),
         ("docs/id.key", "x"),
         ("docs/readme.md", "x"),
@@ -1434,4 +1444,112 @@ fn tree_policy_agrees_with_the_folder_walker() {
             "walker and policy disagree on {path}"
         );
     }
+    for path in [
+        "rules/.meshignore",
+        "other/.gitignore",
+        "rules/s.md",
+        "other/y.md",
+    ] {
+        assert!(walked.contains_key(path), "{path} must synchronize");
+    }
+    for path in ["rules/r.md", "other/z.md", "build/.gitignore"] {
+        assert!(!walked.contains_key(path), "{path} must stay out");
+    }
+}
+
+// US00003 code review fixes (F1, F2).
+
+#[cfg(windows)]
+fn link_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+#[cfg(unix)]
+fn link_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[test]
+fn init_refuses_a_linked_meshignore_without_writing_through_it() {
+    let temp = TempDir::new().unwrap();
+    let outside = temp.path().join("outside.txt");
+    fs::write(&outside, "original\n").unwrap();
+    let vault = temp.path().join("vault");
+    fs::create_dir_all(vault.join(".obsidian")).unwrap();
+    if let Err(error) = link_file(&outside, &vault.join(".meshignore")) {
+        // Creating symlinks needs Developer Mode or elevation on Windows.
+        eprintln!("skipped: cannot create a symlink here: {error}");
+        return;
+    }
+    let error = Workspace::init(&vault, identity("Alice"), None, "main".into())
+        .err()
+        .expect("a linked .meshignore is unsupported")
+        .to_string();
+    assert!(error.contains("Symbolic links are unsupported"), "{error}");
+    assert_eq!(fs::read(&outside).unwrap(), b"original\n");
+}
+
+#[test]
+fn an_ignored_meshignore_still_synchronizes_and_excludes() {
+    let temp = TempDir::new().unwrap();
+    let (mut alice, mut bob) = two_devices_sharing_layout(&temp, "layout");
+    fs::write(alice.root.join(".gitignore"), ".meshignore\n").unwrap();
+    finish(&mut alice);
+    bob.sync().unwrap();
+    // AC 15: the rule file is matched by .gitignore, yet it reaches main and
+    // the exclusion behaves as in AC 1.
+    exclude_layout(&alice);
+    assert!(alice.capture_at(now()).unwrap());
+    finish(&mut alice);
+    assert!(alice.state.attention.is_none());
+    let files = shared(&alice);
+    assert_eq!(files[".meshignore"], format!("{LAYOUT}\n").as_bytes());
+    assert!(!files.contains_key(LAYOUT));
+    assert_eq!(
+        fs::read_to_string(alice.root.join(LAYOUT)).unwrap(),
+        "layout"
+    );
+    assert_main_respects_its_rules(&alice);
+    bob.sync().unwrap();
+    assert!(bob.state.attention.is_none());
+    assert_eq!(
+        fs::read_to_string(bob.root.join(".meshignore")).unwrap(),
+        format!("{LAYOUT}\n")
+    );
+    assert_eq!(fs::read_to_string(bob.root.join(LAYOUT)).unwrap(), "layout");
+    fs::write(bob.root.join(LAYOUT), "layout of Bob").unwrap();
+    assert!(!bob.capture_at(now()).unwrap());
+}
+
+#[test]
+fn a_rule_file_that_ignores_itself_still_synchronizes() {
+    let temp = TempDir::new().unwrap();
+    let mut workspace = init(temp.path(), "Alice", None);
+    fs::write(workspace.root.join("note.md"), "note").unwrap();
+    finish(&mut workspace);
+    fs::write(workspace.root.join(".gitignore"), ".gitignore\nnote.md\n").unwrap();
+    assert!(workspace.capture_at(now()).unwrap());
+    finish(&mut workspace);
+    assert!(workspace.state.attention.is_none());
+    let files = shared(&workspace);
+    assert!(files.contains_key(".gitignore"));
+    assert!(!files.contains_key("note.md"));
+    assert_eq!(
+        fs::read_to_string(workspace.root.join("note.md")).unwrap(),
+        "note"
+    );
+}
+
+#[test]
+fn a_rule_file_inside_an_excluded_folder_stays_out() {
+    let temp = TempDir::new().unwrap();
+    let mut workspace = init(temp.path(), "Alice", None);
+    fs::create_dir_all(workspace.root.join("build")).unwrap();
+    fs::write(workspace.root.join(".gitignore"), "build/\n").unwrap();
+    fs::write(workspace.root.join("build/.meshignore"), "x\n").unwrap();
+    fs::write(workspace.root.join("note.md"), "note").unwrap();
+    finish(&mut workspace);
+    let files = shared(&workspace);
+    assert!(files.contains_key(".gitignore"));
+    assert!(!files.contains_key("build/.meshignore"));
 }

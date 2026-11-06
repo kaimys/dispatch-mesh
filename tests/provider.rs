@@ -791,3 +791,58 @@ fn a_failed_summary_is_persisted_for_status_and_cleared_by_the_next_success() {
     assert_eq!(status["status"], "synced", "{status:#}");
     assert!(status["summary_failure"].is_null() && status["reason"].is_null());
 }
+
+#[tokio::test]
+async fn excluded_files_are_described_without_their_text_even_when_text_sharing_is_on() {
+    let (url, receiver, thread) = serve(
+        r#"{"title":"Stop synchronizing the layout","description":"Exclude the per-device layout."}"#,
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(
+        temp.path(),
+        Identity {
+            name: "Alice".into(),
+            email: "alice@example.test".into(),
+        },
+        None,
+        "main".into(),
+    )
+    .unwrap();
+    let mut config = workspace.config.clone();
+    let mut session = session();
+    config.provider = Some(ProviderConfig {
+        base_url: url,
+        model: "test".into(),
+        api_key_env: None,
+        json_mode: true,
+        send_text: true,
+    });
+    session.changes.insert(
+        ".obsidian/workspace.json".into(),
+        Change {
+            base: Some(b"{\"private-layout\":1}".to_vec()),
+            content: None,
+            intent: None,
+            last_edit: now(),
+        },
+    );
+    session.excluded.insert(".obsidian/workspace.json".into());
+    ai::generate(&config, &session).await;
+    let request = receiver.recv().unwrap();
+    let text = request["messages"][1]["content"].as_str().unwrap();
+    assert!(!text.contains("private-layout"), "{text}");
+    let payload: Value = serde_json::from_str(text).unwrap();
+    let changes = payload["changes"].as_array().unwrap();
+    let excluded = changes
+        .iter()
+        .find(|c| c["path"] == ".obsidian/workspace.json")
+        .unwrap();
+    assert_eq!(excluded["operation"], "excluded");
+    assert_eq!(excluded["content_available"], false);
+    assert!(excluded.get("before").is_none() && excluded.get("after").is_none());
+    let edited = changes.iter().find(|c| c["path"] == "guide.md").unwrap();
+    assert_eq!(edited["operation"], "added");
+    assert_eq!(edited["content_available"], true);
+    assert_eq!(edited["after"], "confidential sample text");
+    thread.join().unwrap();
+}
