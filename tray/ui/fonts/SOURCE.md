@@ -4,6 +4,9 @@ Bundled for the status window (US00012 Q3). Licensed under the SIL Open Font Lic
 
 Taken on 2026-11-07 from the official IBM npm packages, version 1.1.0 of both, `fonts/complete/woff2/`. Each tarball matched the registry's `sha512` integrity value before extraction.
 
+- `@ibm/plex-sans@1.1.0`: https://registry.npmjs.org/@ibm/plex-sans/-/plex-sans-1.1.0.tgz
+- `@ibm/plex-mono@1.1.0`: https://registry.npmjs.org/@ibm/plex-mono/-/plex-mono-1.1.0.tgz
+
 | File | Package | SHA-256 |
 |---|---|---|
 | `IBMPlexSans-Regular.woff2` | `@ibm/plex-sans@1.1.0` | `ba711a3085ff9f27440b6b9c4550cfc47c97bf36591d5da958b975bb3add8c1a` |
