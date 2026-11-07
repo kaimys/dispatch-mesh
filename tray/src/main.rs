@@ -83,9 +83,16 @@ fn on_change(app: &AppHandle, workspaces: &[Workspace]) {
 
 pub fn show_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        fit_to_work_area(&window);
         let _ = window.show();
         let _ = window.unminimize();
+        // Fit only restored geometry: a maximized window's outer rectangle
+        // includes Windows' invisible borders and always looks too large,
+        // and resizing or moving it would undo the maximize (review re-check
+        // F1). The fit runs after `unminimize`, because a minimized window
+        // reports a parking position far off screen.
+        if !window.is_maximized().unwrap_or(true) {
+            fit_to_work_area(&window);
+        }
         let _ = window.set_focus();
     }
 }

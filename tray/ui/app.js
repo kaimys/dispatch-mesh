@@ -180,11 +180,13 @@ function sessionItem(session) {
     el("div", { class: "session-body" },
       el("p", { class: "line1" },
         el("span", { class: "author ellipsis" }, session.author),
-        el("span", { class: "meta ellipsis" }, meta)),
+        // Clipped parts keep their own tooltip with the full text; the rest
+        // of the row shows the author and changed files (review re-check F3).
+        el("span", { class: "meta ellipsis", title: meta }, meta)),
       // A summary title wraps; a file list stays on one line.
       el("p", { class: session.line_is_title ? "line2 title" : "line2 ellipsis" }, session.line),
       session.line_is_title ? el("span", { class: "visually-hidden" }, session.files_text) : null,
-      session.purpose ? el("p", { class: "purpose ellipsis" }, session.purpose) : null,
+      session.purpose ? el("p", { class: "purpose ellipsis", title: session.purpose }, session.purpose) : null,
       el("div", { class: "line3" },
         session.discarded
           ? el("span", { class: "tag", "aria-hidden": "true" }, session.stage)
