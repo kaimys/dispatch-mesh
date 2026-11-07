@@ -83,9 +83,29 @@ fn on_change(app: &AppHandle, workspaces: &[Workspace]) {
 
 pub fn show_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        fit_to_work_area(&window);
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+    }
+}
+
+/// The window opens at 440 × 640 (US00012 Q7); on a screen shorter than
+/// that, it takes the work area's height instead of running off screen.
+fn fit_to_work_area(window: &tauri::WebviewWindow) {
+    let (Ok(Some(monitor)), Ok(outer), Ok(inner)) = (
+        window.current_monitor(),
+        window.outer_size(),
+        window.inner_size(),
+    ) else {
+        return;
+    };
+    let available = monitor.work_area().size.height;
+    if outer.height > available {
+        // `set_size` sets the inner size; the title bar and frame stay.
+        let frame = outer.height - inner.height;
+        let height = available.saturating_sub(frame);
+        let _ = window.set_size(tauri::PhysicalSize::new(inner.width, height));
     }
 }
 

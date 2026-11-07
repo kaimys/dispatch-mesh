@@ -577,9 +577,12 @@ pub struct SavedCopyView {
 pub fn conflicts_placeholder(count: usize) -> String {
     match count {
         0 => "No unresolved conflicts.".to_owned(),
+        1 => {
+            "1 unresolved conflict. Review it with the command line until conflict review arrives."
+                .to_owned()
+        }
         n => format!(
-            "{}. Review them with the command line until conflict review arrives.",
-            plural(n, "unresolved conflict", "unresolved conflicts")
+            "{n} unresolved conflicts. Review them with the command line until conflict review arrives."
         ),
     }
 }
@@ -1395,12 +1398,100 @@ mod tests {
         assert!(!synced.finish_secondary && synced.reassurance.is_none());
     }
 
+    /// The stylesheet's tokens, light and dark (dark overrides light).
+    fn tokens() -> [std::collections::BTreeMap<String, String>; 2] {
+        let css = include_str!("../ui/app.css");
+        let (light, dark) = css
+            .split_once("@media (prefers-color-scheme: dark)")
+            .expect("a dark block");
+        let read = |block: &str| -> std::collections::BTreeMap<String, String> {
+            block
+                .lines()
+                .filter_map(|line| {
+                    let (name, value) = line.trim().strip_prefix("--")?.split_once(':')?;
+                    let value = value.trim().trim_end_matches(';');
+                    value
+                        .starts_with('#')
+                        .then(|| (name.to_owned(), value.to_owned()))
+                })
+                .collect()
+        };
+        let light = read(light);
+        let mut both = light.clone();
+        both.extend(read(dark.split("\n}\n").next().unwrap()));
+        [light, both]
+    }
+
+    fn luminance(hex: &str) -> f64 {
+        let hex = hex.trim_start_matches('#');
+        let channel = |i: usize| {
+            let c = f64::from(u8::from_str_radix(&hex[i..i + 2], 16).unwrap()) / 255.0;
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(0) + 0.7152 * channel(2) + 0.0722 * channel(4)
+    }
+
+    fn contrast(a: &str, b: &str) -> f64 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn every_text_color_in_the_stylesheet_meets_4_5_to_1() {
+        // AC 6: text tokens on the grounds they are drawn on, in both themes.
+        let pairs = [
+            ("text", "ground"),
+            ("text", "surface"),
+            ("text-2", "ground"),
+            ("text-2", "surface"),
+            ("text-3", "ground"),
+            ("text-3", "surface"),
+            ("action", "surface"),
+            ("on-action", "action"),
+            ("on-attention", "attention"),
+            ("attention-text", "attention-card"),
+            ("text-2", "attention-card"),
+            ("text-3", "attention-card"),
+            ("text", "offline-card"),
+            ("text-2", "offline-card"),
+            ("text-3", "offline-card"),
+        ];
+        for (theme, tokens) in ["light", "dark"].iter().zip(tokens()) {
+            for (fg, bg) in pairs {
+                let ratio = contrast(&tokens[fg], &tokens[bg]);
+                assert!(ratio >= 4.5, "{theme}: {fg} on {bg} is {ratio:.2}:1");
+            }
+        }
+    }
+
+    #[test]
+    fn avatar_colors_carry_white_initials_and_match_the_stylesheet() {
+        let css = include_str!("../ui/app.css");
+        for (index, color) in AVATAR_COLORS.iter().enumerate() {
+            assert!(contrast("#FFFFFF", color) >= 4.5, "{color}");
+            assert!(
+                css.contains(&format!(".avatar.c{index} {{ background: {color}; }}")),
+                "app.css .avatar.c{index} must be {color}"
+            );
+        }
+        assert!(contrast("#FFFFFF", YOU_COLOR) >= 4.5);
+        assert!(css.contains(&format!(".avatar.you {{ background: {YOU_COLOR}; }}")));
+    }
+
     #[test]
     fn the_conflicts_tab_shows_a_placeholder_until_conflict_review() {
         assert_eq!(conflicts_placeholder(0), "No unresolved conflicts.");
         assert_eq!(
             conflicts_placeholder(1),
-            "1 unresolved conflict. Review them with the command line until conflict review arrives."
+            "1 unresolved conflict. Review it with the command line until conflict review arrives."
+        );
+        assert_eq!(
+            conflicts_placeholder(3),
+            "3 unresolved conflicts. Review them with the command line until conflict review arrives."
         );
         let none = view(&[running(0, "A", Summary::Synced, None)]).remove(0);
         assert_eq!(

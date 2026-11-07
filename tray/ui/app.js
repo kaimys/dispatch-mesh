@@ -1,6 +1,7 @@
 // Status window. Renders the host's view model; all wording comes from
 // `model.rs`, so the tray and the window always agree. Data is only ever
-// inserted as text, never as markup.
+// inserted as text, never as markup. Layout follows the desktop app design
+// spec (US00012).
 "use strict";
 
 const { invoke } = window.__TAURI__.core;
@@ -14,6 +15,7 @@ let lastAnnounced = "";
 const finishing = new Set(); // workspace ids whose Finish session is under way
 const errors = new Map(); // workspace id -> last failed action's message
 const copiesOpen = new Set(); // workspace ids whose saved-copies list is expanded
+const tabs = new Map(); // workspace id -> "activity" | "conflicts"
 
 const SVG = "http://www.w3.org/2000/svg";
 
@@ -22,6 +24,7 @@ function el(tag, attrs = {}, ...children) {
   for (const [key, value] of Object.entries(attrs)) {
     if (key === "class") node.className = value;
     else if (key === "onclick") node.addEventListener("click", value);
+    else if (key === "onkeydown") node.addEventListener("keydown", value);
     else node.setAttribute(key, value);
   }
   for (const child of children) {
@@ -38,29 +41,26 @@ function svg(tag, attrs) {
   return node;
 }
 
-// The tray mark and corner badge (design deliverable 1), so the window's state
-// glyph matches the icon. The badge shape, not its color, carries the state.
-const BADGE = {
-  working: "M12 10a2 2 0 1 1-2 2",
-  offline: "M10.5 13.5l3-3",
-  attention: "M12 10v2.3M12 14.1v0.05",
-};
-
-function glyph(tone, size = 20) {
-  const root = svg("svg", { width: size, height: size, viewBox: "0 0 16 16", "aria-hidden": "true" });
-  const color = "var(--text)";
-  const mark = svg("g", { fill: color, stroke: color, opacity: tone === "offline" || tone === "neutral" ? "0.5" : "1" });
-  mark.append(svg("path", { d: "M4 4L12 4M4 4L4 12M12 4L4 12", "stroke-width": "1.4", fill: "none" }));
+// The app mark from the tray icon (design spec, *Tray icon*), without a badge;
+// the neutral state's glyph (already running).
+function mark(size, dim = false) {
+  const root = svg("svg", { width: size, height: size, viewBox: "0 0 16 16", "aria-hidden": "true", class: "glyph" });
+  const g = svg("g", { fill: "var(--mark)", stroke: "var(--mark)", opacity: dim ? "0.5" : "1" });
+  g.append(svg("path", { d: "M4 4L12 4M4 4L4 12M12 4L4 12", "stroke-width": "1.4", fill: "none" }));
   for (const [cx, cy] of [[4, 4], [12, 4], [4, 12]]) {
-    mark.append(svg("circle", { cx, cy, r: "2.2", stroke: "none" }));
+    g.append(svg("circle", { cx, cy, r: "2.2", stroke: "none" }));
   }
-  root.append(mark);
-  if (BADGE[tone]) {
-    root.append(svg("circle", { cx: 12, cy: 12, r: "4.6", fill: "var(--surface)" }));
-    root.append(svg("circle", { cx: 12, cy: 12, r: "3.6", fill: `var(--${tone})` }));
-    root.append(svg("path", { d: BADGE[tone], fill: "none", stroke: "var(--glyph)", "stroke-width": "1.3", "stroke-linecap": "round" }));
-  }
+  root.append(g);
   return root;
+}
+
+// A status glyph exported by the design (ui/glyphs), light or dark with the
+// system theme. Its accessible name is the state label.
+function statusGlyph(name, label, size) {
+  if (name === "none") return mark(size, true);
+  return el("picture", { class: "glyph" },
+    el("source", { srcset: `glyphs/status-${name}-dark.svg`, media: "(prefers-color-scheme: dark)" }),
+    el("img", { src: `glyphs/status-${name}-light.svg`, alt: label, width: size, height: size, class: "glyph" }));
 }
 
 function retryButton(ws) {
@@ -69,16 +69,6 @@ function retryButton(ws) {
     "data-key": `retry-${ws.id}`,
     onclick: () => invoke("retry", { id: ws.id }),
   }, "Retry");
-}
-
-function alreadyRunning(ws) {
-  return el("section", { class: "card", "aria-labelledby": `state-${ws.id}` },
-    el("div", { class: "state", id: `state-${ws.id}` }, glyph("neutral"), ws.label),
-    el("p", { class: "reason" },
-      `Another Dispatch Mesh — from the command line or a second tray app — is looking after ${ws.name}. ` +
-      "Only one can at a time. Your files keep syncing through it."),
-    retryButton(ws),
-    el("p", { class: "muted" }, "Retry after closing the other one."));
 }
 
 // Times arrive as Unix seconds. Relative times are redrawn every 30 s.
@@ -129,49 +119,84 @@ function finishButton(ws, primary) {
   }, busy ? "Finishing…" : "Finish session");
 }
 
+function showTab(ws, tab) {
+  tabs.set(ws.id, tab);
+  render();
+  const again = app.querySelector(`[data-key="tab-${tab}-${ws.id}"]`);
+  if (again) again.focus();
+}
+
+function openConflictsButton(ws) {
+  return el("button", {
+    class: "primary",
+    "data-key": `open-conflicts-${ws.id}`,
+    onclick: () => showTab(ws, "conflicts"),
+  }, "Open conflicts");
+}
+
+function alreadyRunning(ws) {
+  return el("section", { class: "card", "aria-labelledby": `state-${ws.id}` },
+    el("div", { class: "card-main" },
+      statusGlyph(ws.glyph, ws.label, 28),
+      el("div", { class: "card-text" },
+        el("p", { class: "state-label", id: `state-${ws.id}` }, ws.label),
+        el("p", { class: "body" },
+          `Another Dispatch Mesh — from the command line or a second tray app — is looking after ${ws.name}. ` +
+          "Only one can at a time. Your files keep syncing through it."))),
+    el("div", { class: "actions" },
+      retryButton(ws),
+      el("p", { class: "note" }, "Retry after closing the other one.")));
+}
+
 function card(ws) {
   if (ws.already_running) return alreadyRunning(ws);
-  return el("section", { class: `card ${ws.tone}`, "aria-labelledby": `state-${ws.id}` },
-    el("div", { class: "state", id: `state-${ws.id}` }, glyph(ws.tone), ws.label),
-    ws.reason ? el("p", { class: "reason" }, ws.reason) : null,
-    ws.note ? el("p", { class: "reason" }, ws.note) : null,
+  const sync = syncLine(ws);
+  const buttons = [
+    ws.action === "open_conflicts" ? openConflictsButton(ws) : null,
     ws.action === "finish_session" ? finishButton(ws, true) : null,
-    ws.retry ? retryButton(ws) : null);
+    ws.finish_secondary ? finishButton(ws, false) : null,
+    ws.retry ? retryButton(ws) : null,
+  ].filter(Boolean);
+  return el("section", { class: `card ${ws.tone}`, "aria-labelledby": `state-${ws.id}` },
+    el("div", { class: "card-main" },
+      statusGlyph(ws.glyph, ws.label, 28),
+      el("div", { class: "card-text" },
+        el("p", { class: "state-label", id: `state-${ws.id}` }, ws.label),
+        ws.body ? el("p", { class: "body" }, ws.body) : null,
+        ws.reassurance ? el("p", { class: "reassurance" }, ws.reassurance) : null)),
+    buttons.length || sync
+      ? el("div", { class: "actions" }, ...buttons, sync ? el("p", { class: "sync" }, sync) : null)
+      : null);
 }
 
-// The stage track: each step says in words whether it is done, current or to
-// come, and draws a different mark for each, so color is never the only cue.
-const STEP = { done: ["✓", "done"], current: ["●", "current step"], todo: ["○", "not yet"] };
-
-function track(session) {
-  if (session.steps.length === 0) return null;
-  return el("ol", { class: "track", "aria-label": "Progress" }, ...session.steps.map((step) =>
-    el("li", { class: `step ${step.state}` },
-      el("span", { class: "mark", "aria-hidden": "true" }, STEP[step.state][0]),
-      step.label,
-      el("span", { class: "visually-hidden" }, ` (${STEP[step.state][1]})`))));
-}
-
+// One session row (design spec, *Session row*). The track is drawn for the
+// eye only; screen readers hear the stage once, as "Stage: …, 2 of 4".
 function sessionItem(session) {
-  const heading = session.title || session.files.join(", ") || "No files";
+  const meta = `${session.files_label} · started ${at(session.started_at)} · last saved ${ago(session.last_saved)}`;
   return el("li", { class: "session" },
-    el("p", { class: "session-title" }, heading),
-    el("p", { class: "stage" }, session.stage),
-    track(session),
-    session.title ? el("p", { class: "files" }, session.files.join(", ")) : null,
-    ...session.purposes.map((purpose) => el("p", { class: "purpose" }, `Requested purpose: ${purpose}`)),
-    el("p", { class: "muted" },
-      `${session.author} · started ${at(session.started_at)} · last saved ${ago(session.last_saved)}`));
+    el("div", { class: `avatar ${session.avatar.color}`, "aria-hidden": "true" }, session.avatar.initials),
+    el("div", { class: "session-body" },
+      el("p", { class: "line1" },
+        el("span", { class: "author" }, session.author),
+        el("span", { class: "meta ellipsis", title: meta }, meta)),
+      el("p", { class: "line2 ellipsis", title: session.line }, session.line),
+      session.purpose ? el("p", { class: "purpose ellipsis", title: session.purpose }, session.purpose) : null,
+      el("div", { class: "line3" },
+        session.discarded
+          ? el("span", { class: "tag", "aria-hidden": "true" }, session.stage)
+          : el("span", { class: "track", "aria-hidden": "true" },
+            ...session.segments.map((kind) => el("span", { class: `seg ${kind}` }))),
+        session.discarded ? null : el("span", { class: "stage", "aria-hidden": "true" }, session.stage),
+        el("span", { class: "visually-hidden" }, session.stage_text))));
 }
 
 function activity(ws) {
-  return el("section", { class: "activity", "aria-labelledby": `activity-${ws.id}` },
-    el("div", { class: "section-head" },
-      el("h2", { id: `activity-${ws.id}` }, "Recent activity"),
-      ws.open_session && ws.action !== "finish_session" ? finishButton(ws, false) : null),
+  return [
     ws.sessions.length
-      ? el("ol", { class: "sessions" }, ...ws.sessions.map(sessionItem))
-      : el("p", { class: "muted" }, "No sessions yet. Edits you save here appear in this list."));
+      ? el("ol", { class: "sessions", "aria-label": "Recent activity" }, ...ws.sessions.map(sessionItem))
+      : el("p", { class: "muted" }, "No sessions yet. Edits you save here appear in this list."),
+    savedCopies(ws),
+  ];
 }
 
 function savedCopies(ws) {
@@ -180,9 +205,9 @@ function savedCopies(ws) {
     el("summary", { "data-key": `copies-${ws.id}` }, `Saved copies · ${ws.saved_copies.length}`),
     el("p", { class: "muted" },
       "Mesh kept these versions aside before writing incoming changes over them. To use one, copy it back yourself."),
-    el("ul", { class: "list" }, ...ws.saved_copies.map((copy) =>
+    el("ul", { class: "copy-list" }, ...ws.saved_copies.map((copy) =>
       el("li", { class: "copy" },
-        el("span", { class: "path" }, copy.path),
+        el("span", { class: "path ellipsis", title: copy.path }, copy.path),
         el("span", { class: "muted" }, `kept ${at(copy.created_at)}`),
         el("button", {
           class: "secondary",
@@ -197,43 +222,97 @@ function savedCopies(ws) {
   return details;
 }
 
+// The section nav: Activity and Conflicts as tabs (US00012 Q2). Left and right
+// arrows move between them.
+function sectionNav(ws) {
+  const current = tabs.get(ws.id) || "activity";
+  const tab = (key, label, extra = {}, ...children) => el("button", {
+    role: "tab",
+    id: `tab-${key}-${ws.id}`,
+    "data-key": `tab-${key}-${ws.id}`,
+    "aria-selected": String(current === key),
+    "aria-controls": `panel-${ws.id}`,
+    tabindex: current === key ? "0" : "-1",
+    onclick: () => showTab(ws, key),
+    onkeydown: (event) => {
+      if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+        event.preventDefault();
+        showTab(ws, key === "activity" ? "conflicts" : "activity");
+      }
+    },
+    ...extra,
+  }, label, ...children);
+  const nav = el("div", { class: "tabs", role: "tablist", "aria-label": "Sections" },
+    tab("activity", "Activity"),
+    tab("conflicts", "Conflicts", { "aria-label": ws.conflicts_tab },
+      ws.conflict_count ? el("span", { class: "badge", "aria-hidden": "true" }, String(ws.conflict_count)) : null));
+  const panel = el("div", {
+    class: "panel",
+    role: "tabpanel",
+    id: `panel-${ws.id}`,
+    "aria-labelledby": `tab-${current}-${ws.id}`,
+  }, ...(current === "conflicts"
+    ? [el("p", { class: "placeholder" }, ws.conflicts_placeholder)]
+    : activity(ws)));
+  return [nav, panel];
+}
+
+function topRow(several, ws) {
+  if (!ws) {
+    return el("div", { class: "top" },
+      el("span", { class: "name" }, `All workspaces · ${workspaces.length}`));
+  }
+  // No app mark: the native title bar already shows it (design spec).
+  return el("div", { class: "top" },
+    several
+      ? el("button", {
+        class: "switcher",
+        "data-key": "back",
+        "aria-label": `${ws.name}. Show all workspaces`,
+        onclick: () => { selected = null; render(); },
+      }, el("span", { class: "name ellipsis" }, ws.name), el("span", { class: "chevron", "aria-hidden": "true" }, "▾"))
+      : el("span", { class: "name ellipsis" }, ws.name));
+}
+
 function detail(ws, several) {
-  const sync = syncLine(ws);
   const error = errors.get(ws.id);
+  const running = !(ws.already_running || ws.retry);
   return [
-    several ? el("button", { class: "link", "data-key": "back", onclick: () => { selected = null; render(); } }, "‹ All workspaces") : null,
-    el("header", {}, el("h1", {}, ws.name), el("p", { class: "path" }, ws.path),
-      sync ? el("p", { class: "sync" }, sync) : null),
-    card(ws),
-    error ? el("p", { class: "error", role: "alert" }, error) : null,
-    ws.already_running || ws.retry ? null : activity(ws),
-    savedCopies(ws),
+    topRow(several, ws),
+    el("div", { class: "content" },
+      el("p", { class: "path ellipsis", title: ws.path }, ws.path),
+      card(ws),
+      error ? el("p", { class: "error", role: "alert" }, error) : null,
+      ...(running ? sectionNav(ws) : [])),
   ];
 }
 
 function list() {
   return [
-    el("h2", {}, `All workspaces · ${workspaces.length}`),
-    el("ul", { class: "list" }, ...workspaces.map((ws) =>
-      el("li", {}, el("button", {
-        class: `row ${ws.tone}`,
-        "data-key": `row-${ws.id}`,
-        onclick: () => { selected = ws.id; render(); },
-      },
-      glyph(ws.tone),
-      el("span", { class: "name" }, ws.name),
-      el("span", { class: "label" }, ws.reason && ws.tone === "attention" ? `${ws.label} · ${ws.reason}` : ws.label),
-      el("span", { class: "path" }, ws.path))))),
+    topRow(true, null),
+    el("div", { class: "content" },
+      el("ul", { class: "list" }, ...workspaces.map((ws) =>
+        el("li", {}, el("button", {
+          class: `row ${ws.tone}`,
+          "data-key": `row-${ws.id}`,
+          onclick: () => { selected = ws.id; render(); },
+        },
+        statusGlyph(ws.glyph, ws.label, 22),
+        el("span", { class: "name" }, ws.name),
+        el("span", { class: "label" }, ws.reason && ws.tone === "attention" ? `${ws.label} · ${ws.reason}` : ws.label),
+        el("span", { class: "path ellipsis", title: ws.path }, ws.path)))))),
   ];
 }
 
 function empty() {
   return [
-    el("h1", {}, "No workspace yet"),
-    el("p", {}, "Set up a folder with the command line, then start the tray with it:"),
-    el("p", {}, el("code", {}, 'dispatch-mesh --workspace "<folder>" init --name "<your name>" --email "<your email>"')),
-    el("p", {}, el("code", {}, 'dispatch-mesh-tray --workspace "<folder>"')),
-    el("p", { class: "muted" }, "Adding workspaces from this window comes with guided setup."),
+    el("div", { class: "top" }, el("span", { class: "name" }, "Dispatch Mesh")),
+    el("div", { class: "content" },
+      el("h1", { class: "empty-title" }, "No workspace yet"),
+      el("p", {}, "Set up a folder with the command line, then start the tray with it:"),
+      el("p", {}, el("code", {}, 'dispatch-mesh --workspace "<folder>" init --name "<your name>" --email "<your email>"')),
+      el("p", {}, el("code", {}, 'dispatch-mesh-tray --workspace "<folder>"')),
+      el("p", { class: "muted" }, "Adding workspaces from this window comes with guided setup.")),
   ];
 }
 
