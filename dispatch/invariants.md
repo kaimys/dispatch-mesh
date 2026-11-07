@@ -8,6 +8,7 @@ Board vocabulary: `Backlog` → `Refinement` → `In progress` → `Review` → 
 
 - The wiki is the only record of ticket state. There is no issue tracker and no team chat integration; questions for the requester are recorded in the ticket.
 - Precedence when documents conflict: ADRs in `07_Engineering/Decisions/` (accepted and proposed both bind; only superseded decisions may be ignored) → `02_Product/Dispatch Mesh requirements and architecture.md` → `02_Product/Dispatch Mesh milestone plan.md` → the ticket → discovery notes. The product behavior in `AGENTS.md` is derived from these and must be kept consistent with them.
+- UI work (tray, status window, any desktop-app view) follows `06_UX/Dispatch Mesh desktop app — design spec.md`: tokens, glyphs, components and per-view rules. Read that page, not the PDF or HTML export, which yield no text. Where the spec and a frame PNG disagree, the spec wins.
 
 ## The ticket freeze
 
