@@ -12,6 +12,9 @@ use crate::{
 use serde::Serialize;
 use std::collections::BTreeSet;
 
+/// How the attention reason begins when the live folder cannot be captured.
+pub const CAPTURE_WAITING: &str = "Local capture waiting: ";
+
 /// Workspace summary, listed in precedence order: the first that applies wins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -174,7 +177,7 @@ impl Workspace {
                 n => format!("{n} unresolved conflicts"),
             })
         } else if let Some(error) = &capture_error {
-            Some(format!("Local capture waiting: {error}"))
+            Some(format!("{CAPTURE_WAITING}{error}"))
         } else {
             self.state
                 .attention

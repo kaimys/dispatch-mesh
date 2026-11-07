@@ -96,6 +96,10 @@ pub const SYNC_FAILURE: &str = "Synchronization waiting: ";
 /// finishing the session resolves it.
 pub const RECEIVED_DRAFT_DEPENDENCY: &str = "Edits depend on a received draft";
 
+/// The attention reason when dependent edits would create a circular draft
+/// dependency; finishing the session resolves it.
+pub const CIRCULAR_DEPENDENCY: &str = "Dependent edits are saved locally. Finish the current session to avoid a circular draft dependency.";
+
 /// `last_sync` is rewritten only when the stored time is at least this old.
 pub const LAST_SYNC_PRECISION: u64 = 60;
 
@@ -542,7 +546,7 @@ impl Workspace {
                 for contributor in contributors {
                     if self.depends_on(&contributor, &id) {
                         self.state.pending_capture = Some(files.clone());
-                        self.state.attention = Some("Dependent edits are saved locally. Finish the current session to avoid a circular draft dependency.".into());
+                        self.state.attention = Some(CIRCULAR_DEPENDENCY.into());
                         self.save()?;
                         return Err(DependentEditsPreserved.into());
                     }

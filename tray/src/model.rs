@@ -5,9 +5,9 @@
 //! Nothing here touches Tauri, so every rule is unit-tested.
 
 use dispatch_mesh::{
-    engine::{RECEIVED_DRAFT_DEPENDENCY, SYNC_FAILURE},
+    engine::{CIRCULAR_DEPENDENCY, RECEIVED_DRAFT_DEPENDENCY, SYNC_FAILURE},
     runner::RunnerSnapshot,
-    status::{SessionStatus, Stage, Status, Summary},
+    status::{CAPTURE_WAITING, SessionStatus, Stage, Status, Summary},
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -94,7 +94,25 @@ const NOT_SYNCING: &str = "Not syncing";
 const ALREADY_RUNNING: &str = "Mesh is already running for this workspace";
 const STARTING: &str = "Starting";
 pub const OFFLINE_NOTE: &str = "Keep working — your changes upload when the connection returns.";
-pub const RETRY_NOTE: &str = "Mesh retries automatically.";
+/// Reassurance lines under an attention reason (US00012 Q8).
+pub const CONFLICTS_REASSURANCE: &str =
+    "Both versions of each file are kept. Other files keep syncing.";
+pub const SYNC_REASSURANCE: &str =
+    "Your edits are saved on this device. Mesh retries automatically.";
+pub const CAPTURE_REASSURANCE: &str =
+    "Saved files stay as they are. Mesh tries again on the next save.";
+pub const DEPENDENT_REASSURANCE: &str =
+    "Your edits are saved on this device. Finish the session to share them.";
+pub const SUMMARY_REASSURANCE: &str =
+    "Your session is added to shared history with a local summary.";
+/// The state card's line for the working and synced states (design spec).
+const SAVED_BODY: &str = "Your latest edits are captured. Sharing them as a draft in a moment.";
+/// Saved on this device without a remote: nothing is shared as a draft.
+const SAVED_LOCAL_BODY: &str = "Your latest edits are captured. They join history after 5 minutes without edits, or when you finish the session.";
+const DRAFT_BODY: &str = "Collaborators can see your session. It joins shared history after 5 minutes without edits, or when you finish it.";
+const SYNCED_BODY: &str = "Everything you saved is in shared history.";
+/// The author of this device's sessions.
+const YOU: &str = "You";
 pub const FINISH_SESSION: &str = "Finish session";
 const NOT_SYNCED_YET: &str = "Not synced yet";
 const THIS_DEVICE_ONLY: &str = "This device only";
@@ -328,71 +346,212 @@ pub fn finish_items(workspaces: &[Workspace]) -> Vec<(String, usize)> {
     }
 }
 
-/// One step of a session's stage track.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct StepView {
-    pub label: &'static str,
-    /// `done`, `current` or `todo`.
-    pub state: &'static str,
+/// The status glyph of the window (design spec, *Glyphs*): the file stem of
+/// `ui/glyphs/status-<glyph>-<light|dark>.svg`, or `none`.
+pub fn status_glyph(icon: Option<Icon>) -> &'static str {
+    match icon {
+        Some(Icon::Attention) => "needs-attention",
+        Some(Icon::Offline) => "offline",
+        Some(Icon::Working) => "working",
+        Some(Icon::UpToDate) => "up-to-date",
+        None => "none",
+    }
 }
 
-/// One session in the activity list.
+/// The state card's line under the label for the working and synced states
+/// (design spec, *State card per summary state*; US00012 Q8).
+fn working_body(status: &Status) -> Option<String> {
+    let line = match status.status {
+        Summary::SavedLocally if status.has_remote => SAVED_BODY,
+        Summary::SavedLocally => SAVED_LOCAL_BODY,
+        Summary::DraftUploaded => DRAFT_BODY,
+        Summary::Synced => SYNCED_BODY,
+        Summary::WaitingForFinalization => {
+            let finishing = status
+                .sessions
+                .iter()
+                .filter(|s| s.device == status.device && s.stage == Stage::WaitingForFinalization)
+                .count();
+            return Some(if finishing > 1 {
+                format!("Adding your {finishing} finished sessions to shared history.")
+            } else {
+                "Adding your finished session to shared history.".to_owned()
+            });
+        }
+        Summary::NeedsAttention | Summary::Offline => return None,
+    };
+    Some(line.to_owned())
+}
+
+/// The reassurance under an attention or offline reason (US00012 Q8). A
+/// reason without an agreed line gets none rather than a guessed one.
+fn reassurance(status: &Status) -> Option<&'static str> {
+    let reason = status.reason.as_deref()?;
+    match status.status {
+        Summary::Offline => Some(OFFLINE_NOTE),
+        Summary::NeedsAttention if !status.unresolved_conflicts.is_empty() => {
+            Some(CONFLICTS_REASSURANCE)
+        }
+        Summary::NeedsAttention if reason.starts_with(SYNC_FAILURE) => Some(SYNC_REASSURANCE),
+        Summary::NeedsAttention if reason.starts_with(CAPTURE_WAITING) => Some(CAPTURE_REASSURANCE),
+        Summary::NeedsAttention
+            if reason.starts_with(RECEIVED_DRAFT_DEPENDENCY) || reason == CIRCULAR_DEPENDENCY =>
+        {
+            Some(DEPENDENT_REASSURANCE)
+        }
+        Summary::NeedsAttention if status.summary_failure.as_deref() == Some(reason) => {
+            Some(SUMMARY_REASSURANCE)
+        }
+        _ => None,
+    }
+}
+
+/// Up to two initials from a name: the first letters of its first and last
+/// word, upper-cased.
+pub fn initials(name: &str) -> String {
+    let words: Vec<&str> = name.split_whitespace().collect();
+    let pick = match words.as_slice() {
+        [] => return "?".to_owned(),
+        [only] => vec![*only],
+        [first, .., last] => vec![*first, *last],
+    };
+    pick.iter()
+        .filter_map(|word| word.chars().next())
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
+/// Avatar colors (US00012 Q9): the same in both themes, each dark enough for
+/// white initials. `ui/app.css` mirrors them as `.avatar.c0` … `.c5` and
+/// `.avatar.you`; a test checks both agree.
+pub const AVATAR_COLORS: [&str; 6] = [
+    "#2457C5", "#7A4FB0", "#2F6B4F", "#B4490B", "#3D3F44", "#0E6E7E",
+];
+pub const YOU_COLOR: &str = "#3D3F44";
+
+/// A stable color index for an author: FNV-1a over the lower-cased email, so
+/// a person has the same color on every device.
+pub fn avatar_color(email: &str) -> usize {
+    let hash = email
+        .to_lowercase()
+        .bytes()
+        .fold(0x811c_9dc5_u32, |hash, byte| {
+            (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+        });
+    hash as usize % AVATAR_COLORS.len()
+}
+
+/// A session's avatar: initials and a color class (`c0` … `c5`, or `you`).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AvatarView {
+    pub initials: String,
+    pub color: String,
+}
+
+/// One session in the activity list (design spec, *Session row*).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SessionView {
     pub id: String,
-    pub stage: &'static str,
-    /// Empty for a discarded session, which left the track.
-    pub steps: Vec<StepView>,
-    pub files: Vec<String>,
+    /// "You" for this device's sessions, else the author's name (US00012 Q5).
     pub author: String,
+    pub own: bool,
+    pub avatar: AvatarView,
+    /// "N files"; the window adds the start and last-save times.
+    pub files_label: String,
     pub started_at: u64,
     pub last_saved: u64,
-    pub purposes: Vec<String>,
-    pub title: Option<String>,
+    /// Line 2: the summary title once published, else the files.
+    pub line: String,
+    /// The requested purpose, when one is recorded ("… +N more" for several).
+    pub purpose: Option<String>,
+    /// The stage, named once; "Discarded" for a discarded session.
+    pub stage: &'static str,
+    /// What screen readers hear instead of the track.
+    pub stage_text: String,
+    /// One entry per track segment: `working`, `synced`, `received` or
+    /// `empty`. Empty for a discarded session, which shows a tag instead.
+    pub segments: Vec<&'static str>,
+    pub discarded: bool,
 }
 
-fn session_view(session: &SessionStatus, has_remote: bool) -> SessionView {
-    let steps = if session.stage == Stage::Discarded {
+const DISCARDED: &str = "Discarded";
+
+fn session_view(session: &SessionStatus, has_remote: bool, this_device: &str) -> SessionView {
+    let own = session.device == this_device;
+    let discarded = session.stage == Stage::Discarded;
+    let stages = track(has_remote);
+    let current = stages
+        .iter()
+        .position(|stage| *stage == session.stage)
+        .unwrap_or_default();
+    let segments = if discarded {
         Vec::new()
     } else {
-        let stages = track(has_remote);
-        // Every non-discarded stage is on the track: a workspace without a
-        // remote receives no drafts and uploads none of its own.
-        let current = stages
-            .iter()
-            .position(|stage| *stage == session.stage)
-            .unwrap_or_default();
-        stages
-            .iter()
-            .enumerate()
-            .map(|(index, stage)| StepView {
-                label: stage_label(*stage),
-                state: match index.cmp(&current) {
-                    std::cmp::Ordering::Less => "done",
-                    std::cmp::Ordering::Equal if *stage == Stage::Published => "done",
-                    std::cmp::Ordering::Equal => "current",
-                    std::cmp::Ordering::Greater => "todo",
-                },
+        (0..stages.len())
+            .map(|index| match index {
+                _ if session.stage == Stage::Published => "synced",
+                0 if !own => "received",
+                index if index <= current => "working",
+                _ => "empty",
             })
             .collect()
     };
+    let stage = if discarded {
+        DISCARDED
+    } else {
+        stage_label(session.stage)
+    };
+    let stage_text = if discarded {
+        format!("Stage: {DISCARDED}")
+    } else {
+        format!("Stage: {stage}, {} of {}", current + 1, stages.len())
+    };
+    let purpose = session
+        .purposes
+        .first()
+        .map(|first| match session.purposes.len() {
+            1 => format!("Requested purpose: {first}"),
+            n => format!("Requested purpose: {first} +{} more", n - 1),
+        });
     SessionView {
         id: session.id.clone(),
-        stage: stage_label(session.stage),
-        steps,
-        files: session.files.clone(),
-        author: session.author.name.clone(),
+        author: if own {
+            YOU.to_owned()
+        } else {
+            session.author.name.clone()
+        },
+        own,
+        avatar: AvatarView {
+            initials: initials(&session.author.name),
+            color: if own {
+                "you".to_owned()
+            } else {
+                format!("c{}", avatar_color(&session.author.email))
+            },
+        },
+        files_label: plural(session.files.len(), "file", "files"),
         started_at: session.started_at,
         last_saved: session.last_saved,
-        purposes: session.purposes.clone(),
-        title: session.title.clone(),
+        line: session
+            .title
+            .clone()
+            .unwrap_or_else(|| session.files.join(", ")),
+        purpose,
+        stage,
+        stage_text,
+        segments,
+        discarded,
     }
 }
 
 /// The activity list (AC 5): every unsettled session, then the
 /// [`SETTLED_SHOWN`] settled ones with the latest last save, each group
 /// newest first. Settling records no time, so the last save ranks them.
-pub fn activity(sessions: &[SessionStatus], has_remote: bool) -> Vec<SessionView> {
+pub fn activity(
+    sessions: &[SessionStatus],
+    has_remote: bool,
+    this_device: &str,
+) -> Vec<SessionView> {
     let newest_first = |list: &mut Vec<&SessionStatus>| {
         list.sort_by(|a, b| (b.last_saved, &b.id).cmp(&(a.last_saved, &a.id)))
     };
@@ -402,7 +561,7 @@ pub fn activity(sessions: &[SessionStatus], has_remote: bool) -> Vec<SessionView
     newest_first(&mut done);
     open.into_iter()
         .chain(done.into_iter().take(SETTLED_SHOWN))
-        .map(|s| session_view(s, has_remote))
+        .map(|s| session_view(s, has_remote, this_device))
         .collect()
 }
 
@@ -414,6 +573,17 @@ pub struct SavedCopyView {
     pub created_at: u64,
 }
 
+/// The Conflicts tab until conflict review arrives (US00012 Q2).
+pub fn conflicts_placeholder(count: usize) -> String {
+    match count {
+        0 => "No unresolved conflicts.".to_owned(),
+        n => format!(
+            "{}. Review them with the command line until conflict review arrives.",
+            plural(n, "unresolved conflict", "unresolved conflicts")
+        ),
+    }
+}
+
 /// One workspace as the status window renders it.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct WorkspaceView {
@@ -421,20 +591,33 @@ pub struct WorkspaceView {
     pub name: String,
     pub path: String,
     pub label: &'static str,
-    /// Tone and glyph: `attention`, `offline`, `working`, `synced` or `neutral`.
+    /// Tone of the card: `attention`, `offline`, `working`, `synced` or `neutral`.
     pub tone: &'static str,
+    /// The status glyph, see [`status_glyph`].
+    pub glyph: &'static str,
+    /// The engine's reason for attention or offline, or why it stopped.
     pub reason: Option<String>,
-    pub note: Option<&'static str>,
+    /// The card's line under the label: the reason, or the state's sentence.
+    pub body: Option<String>,
+    /// The reassurance under the reason, where one is agreed (Q8).
+    pub reassurance: Option<&'static str>,
     pub already_running: bool,
     pub retry: bool,
     /// The last successful sync; `None` with `sync_label` saying why.
     pub last_sync: Option<u64>,
-    /// What the header says instead of a sync time.
+    /// What the card says instead of a sync time.
     pub sync_label: Option<&'static str>,
-    /// Whether **Finish session** is offered.
+    /// Whether the workspace has an open session.
     pub open_session: bool,
-    /// The attention card's primary action: `finish_session` or none.
+    /// The card's primary action: `open_conflicts`, `finish_session` or none.
     pub action: Option<&'static str>,
+    /// **Finish session** as a secondary button: an open session whose card
+    /// has no primary **Finish session**.
+    pub finish_secondary: bool,
+    pub conflict_count: usize,
+    /// Accessible name of the Conflicts tab.
+    pub conflicts_tab: String,
+    pub conflicts_placeholder: String,
     pub sessions: Vec<SessionView>,
     /// Newest first.
     pub saved_copies: Vec<SavedCopyView>,
@@ -445,12 +628,27 @@ pub fn view(workspaces: &[Workspace]) -> Vec<WorkspaceView> {
         .into_iter()
         .map(|w| {
             let status = w.status();
-            let offline = status.is_some_and(|s| s.status == Summary::Offline);
             let attention_reason = status
                 .filter(|s| s.status == Summary::NeedsAttention)
                 .and_then(|s| s.reason.as_deref());
-            let sync_failed = attention_reason.is_some_and(|r| r.starts_with(SYNC_FAILURE));
             let open_session = w.has_open_session();
+            let conflict_count = status.map_or(0, |s| s.unresolved_conflicts.len());
+            let action = if attention_reason.is_some() && conflict_count > 0 {
+                Some("open_conflicts")
+            } else if open_session
+                && attention_reason.is_some_and(|r| r.starts_with(RECEIVED_DRAFT_DEPENDENCY))
+            {
+                Some("finish_session")
+            } else {
+                None
+            };
+            let body = match status {
+                Some(s) if matches!(s.status, Summary::NeedsAttention | Summary::Offline) => {
+                    s.reason.clone()
+                }
+                Some(s) => working_body(s),
+                None => w.reason().map(str::to_owned),
+            };
             WorkspaceView {
                 id: w.id,
                 name: w.name.clone(),
@@ -463,12 +661,10 @@ pub fn view(workspaces: &[Workspace]) -> Vec<WorkspaceView> {
                     Some(Icon::Working) => "working",
                     Some(Icon::UpToDate) => "synced",
                 },
+                glyph: status_glyph(w.icon()),
                 reason: w.reason().map(str::to_owned),
-                note: if offline {
-                    Some(OFFLINE_NOTE)
-                } else {
-                    sync_failed.then_some(RETRY_NOTE)
-                },
+                body,
+                reassurance: status.and_then(reassurance),
                 already_running: w.state == WorkspaceState::AlreadyRunning,
                 retry: matches!(
                     w.state,
@@ -481,11 +677,13 @@ pub fn view(workspaces: &[Workspace]) -> Vec<WorkspaceView> {
                     (true, Some(_)) => None,
                 }),
                 open_session,
-                action: (open_session
-                    && attention_reason.is_some_and(|r| r.starts_with(RECEIVED_DRAFT_DEPENDENCY)))
-                .then_some("finish_session"),
+                action,
+                finish_secondary: open_session && action != Some("finish_session"),
+                conflict_count,
+                conflicts_tab: format!("Conflicts, {conflict_count} unresolved"),
+                conflicts_placeholder: conflicts_placeholder(conflict_count),
                 sessions: status
-                    .map(|s| activity(&s.sessions, s.has_remote))
+                    .map(|s| activity(&s.sessions, s.has_remote, &s.device))
                     .unwrap_or_default(),
                 saved_copies: status
                     .map(|s| {
@@ -788,20 +986,29 @@ mod tests {
         let wiki = get("Team Wiki");
         assert_eq!(wiki.label, "Offline — changes saved on this device");
         assert_eq!(wiki.reason.as_deref(), Some("Could not reach the remote"));
-        assert_eq!(wiki.note, Some(OFFLINE_NOTE));
+        assert_eq!(wiki.reassurance, Some(OFFLINE_NOTE));
+        assert_eq!(wiki.body.as_deref(), Some("Could not reach the remote"));
+        assert_eq!(wiki.glyph, "offline");
         assert_eq!((wiki.tone, wiki.retry), ("offline", false));
         let held = get("Held");
         assert!(held.already_running && held.retry);
         assert_eq!((held.tone, held.label), ("neutral", ALREADY_RUNNING));
+        assert_eq!(held.glyph, "none");
         let broken = get("Broken");
         assert_eq!(broken.reason.as_deref(), Some("Not a Mesh workspace"));
         assert!(broken.retry && !broken.already_running);
-        assert_eq!(broken.tone, "attention");
+        assert_eq!(
+            (broken.tone, broken.glyph),
+            ("attention", "needs-attention")
+        );
+        assert_eq!(broken.body.as_deref(), Some("Not a Mesh workspace"));
         let fine = get("Fine");
         assert_eq!(
-            (fine.reason.clone(), fine.note, fine.retry),
+            (fine.reason.clone(), fine.reassurance, fine.retry),
             (None, None, false)
         );
+        assert_eq!(fine.body.as_deref(), Some(SYNCED_BODY));
+        assert_eq!(fine.glyph, "up-to-date");
     }
 
     fn session(id: &str, stage: Stage, last_saved: u64) -> SessionStatus {
@@ -811,6 +1018,7 @@ mod tests {
                 name: "Alice".into(),
                 email: "alice@example.test".into(),
             },
+            device: "device".into(),
             stage,
             closed: !matches!(stage, Stage::SavedLocally | Stage::DraftUploaded),
             published: stage == Stage::Published,
@@ -838,7 +1046,7 @@ mod tests {
 
     #[test]
     fn activity_lists_every_unsettled_session_and_the_ten_latest_settled() {
-        assert!(activity(&[], true).is_empty());
+        assert!(activity(&[], true, "device").is_empty());
 
         let mut sessions = vec![
             session("open-old", Stage::SavedLocally, 100),
@@ -849,7 +1057,7 @@ mod tests {
             sessions.push(session(&format!("done-{n}"), Stage::Published, 200 + n));
         }
         assert_eq!(
-            ids(&activity(&sessions, true)),
+            ids(&activity(&sessions, true, "device")),
             [
                 "open-new",
                 "finishing",
@@ -870,7 +1078,7 @@ mod tests {
             };
             sessions.push(session(&format!("done-{n}"), stage, 200 + n));
         }
-        let list = activity(&sessions, true);
+        let list = activity(&sessions, true, "device");
         assert_eq!(list.len(), 3 + SETTLED_SHOWN);
         assert_eq!(
             ids(&list[3..]),
@@ -891,7 +1099,7 @@ mod tests {
             session("new-published", Stage::Published, 900),
         ];
         assert_eq!(
-            ids(&activity(&sessions, true)),
+            ids(&activity(&sessions, true, "device")),
             ["old-open", "new-published"]
         );
         for n in 0..SETTLED_SHOWN as u64 {
@@ -899,7 +1107,7 @@ mod tests {
         }
         // Saved long ago, settled just now after a conflict cleared.
         sessions.push(session("settled-late", Stage::Published, 20));
-        let list = activity(&sessions, true);
+        let list = activity(&sessions, true, "device");
         assert_eq!(list[0].id, "old-open");
         assert_eq!(list.len(), 1 + SETTLED_SHOWN);
         assert!(
@@ -908,99 +1116,141 @@ mod tests {
         );
     }
 
-    fn track_of(stage: Stage, has_remote: bool) -> Vec<(&'static str, &'static str)> {
-        session_view(&session("s", stage, 1), has_remote)
-            .steps
-            .iter()
-            .map(|step| (step.label, step.state))
-            .collect()
+    fn row(stage: Stage, has_remote: bool, device: &str) -> SessionView {
+        let mut session = session("s", stage, 1);
+        session.device = device.into();
+        session_view(&session, has_remote, "device")
     }
 
     #[test]
-    fn every_stage_has_a_label_and_a_place_on_the_track() {
+    fn every_stage_fills_the_track_up_to_itself_and_is_named_once() {
+        let own = |stage| {
+            let view = row(stage, true, "device");
+            (view.segments, view.stage, view.stage_text)
+        };
         assert_eq!(
-            track_of(Stage::SavedLocally, true),
-            [
-                ("Saved on this device", "current"),
-                ("Shared as draft", "todo"),
-                ("Finishing up", "todo"),
-                ("Added to shared history", "todo"),
-            ]
+            own(Stage::SavedLocally),
+            (
+                vec!["working", "empty", "empty", "empty"],
+                "Saved on this device",
+                "Stage: Saved on this device, 1 of 4".to_owned()
+            )
         );
         assert_eq!(
-            track_of(Stage::DraftUploaded, true),
-            [
-                ("Saved on this device", "done"),
-                ("Shared as draft", "current"),
-                ("Finishing up", "todo"),
-                ("Added to shared history", "todo"),
-            ]
+            own(Stage::DraftUploaded),
+            (
+                vec!["working", "working", "empty", "empty"],
+                "Shared as draft",
+                "Stage: Shared as draft, 2 of 4".to_owned()
+            )
         );
         assert_eq!(
-            track_of(Stage::WaitingForFinalization, true),
-            [
-                ("Saved on this device", "done"),
-                ("Shared as draft", "done"),
-                ("Finishing up", "current"),
-                ("Added to shared history", "todo"),
-            ]
+            own(Stage::WaitingForFinalization),
+            (
+                vec!["working", "working", "working", "empty"],
+                "Finishing up",
+                "Stage: Finishing up, 3 of 4".to_owned()
+            )
         );
         assert_eq!(
-            track_of(Stage::Published, true),
-            [
-                ("Saved on this device", "done"),
-                ("Shared as draft", "done"),
-                ("Finishing up", "done"),
-                ("Added to shared history", "done"),
-            ]
+            own(Stage::Published),
+            (
+                vec!["synced"; 4],
+                "Added to shared history",
+                "Stage: Added to shared history, 4 of 4".to_owned()
+            )
         );
-        assert!(track_of(Stage::Discarded, true).is_empty());
-        for (stage, label) in [
-            (Stage::SavedLocally, "Saved on this device"),
-            (Stage::DraftUploaded, "Shared as draft"),
-            (Stage::WaitingForFinalization, "Finishing up"),
-            (Stage::Published, "Added to shared history"),
-            (Stage::Discarded, "No changes kept"),
-        ] {
-            assert_eq!(session_view(&session("s", stage, 1), true).stage, label);
-        }
+        let discarded = row(Stage::Discarded, true, "device");
+        assert!(discarded.discarded && discarded.segments.is_empty());
+        assert_eq!(
+            (discarded.stage, discarded.stage_text.as_str()),
+            ("Discarded", "Stage: Discarded")
+        );
     }
 
     #[test]
-    fn a_workspace_without_a_remote_has_no_draft_step() {
+    fn a_received_session_starts_with_a_pale_segment_and_names_its_author() {
+        let view = row(Stage::DraftUploaded, true, "other-device");
+        assert_eq!(view.segments, ["received", "working", "empty", "empty"]);
+        assert_eq!((view.author.as_str(), view.own), ("Alice", false));
+        assert_eq!(view.avatar.initials, "A");
+        assert!(view.avatar.color.starts_with('c'), "{}", view.avatar.color);
+        let published = row(Stage::Published, true, "other-device");
+        assert_eq!(published.segments, vec!["synced"; 4], "published wins");
+        let own = row(Stage::DraftUploaded, true, "device");
+        assert_eq!((own.author.as_str(), own.own), ("You", true));
         assert_eq!(
-            track_of(Stage::WaitingForFinalization, false),
-            [
-                ("Saved on this device", "done"),
-                ("Finishing up", "current"),
-                ("Added to shared history", "todo"),
-            ]
+            (own.avatar.initials.as_str(), own.avatar.color.as_str()),
+            ("A", "you")
         );
+    }
+
+    #[test]
+    fn a_workspace_without_a_remote_has_three_segments_and_no_draft_step() {
+        let view = row(Stage::WaitingForFinalization, false, "device");
+        assert_eq!(view.segments, ["working", "working", "empty"]);
+        assert_eq!(view.stage_text, "Stage: Finishing up, 2 of 3");
         for stage in [
             Stage::SavedLocally,
             Stage::WaitingForFinalization,
             Stage::Published,
         ] {
-            assert!(
-                !track_of(stage, false)
-                    .iter()
-                    .any(|(label, _)| *label == "Shared as draft")
-            );
+            assert_eq!(row(stage, false, "device").segments.len(), 3);
         }
     }
 
     #[test]
-    fn sessions_show_their_own_author_purposes_title_and_times() {
+    fn rows_show_title_or_files_the_file_count_and_one_purpose_line() {
         let mut received = session("bob", Stage::DraftUploaded, 300);
         received.author.name = "Bob".into();
-        received.purposes = vec!["Explain setup".into()];
-        let view = session_view(&received, true);
+        received.device = "bobs-device".into();
+        received.files = vec!["a.md".into(), "b.md".into()];
+        let view = session_view(&received, true, "device");
         assert_eq!(view.author, "Bob", "never the local user");
-        assert_eq!(view.purposes, ["Explain setup"]);
+        assert_eq!(
+            (view.line.as_str(), view.files_label.as_str()),
+            ("a.md, b.md", "2 files")
+        );
         assert_eq!((view.started_at, view.last_saved), (240, 300));
-        assert_eq!(view.title, None);
-        let published = session_view(&session("p", Stage::Published, 1), true);
-        assert_eq!(published.title.as_deref(), Some("Update note"));
+        assert_eq!(view.purpose, None);
+        received.purposes = vec!["Explain setup".into()];
+        assert_eq!(
+            session_view(&received, true, "device").purpose.as_deref(),
+            Some("Requested purpose: Explain setup")
+        );
+        received
+            .purposes
+            .extend(["Fix links".into(), "Add index".into()]);
+        assert_eq!(
+            session_view(&received, true, "device").purpose.as_deref(),
+            Some("Requested purpose: Explain setup +2 more")
+        );
+        let published = session_view(&session("p", Stage::Published, 1), true, "device");
+        assert_eq!(
+            (published.line.as_str(), published.files_label.as_str()),
+            ("Update note", "1 file")
+        );
+    }
+
+    #[test]
+    fn initials_take_the_first_and_last_word() {
+        assert_eq!(initials("Alex Lindqvist"), "AL");
+        assert_eq!(initials("Ada Byron King"), "AK");
+        assert_eq!(initials("bob"), "B");
+        assert_eq!(initials("  "), "?");
+        assert_eq!(initials("Émile Zola"), "ÉZ");
+    }
+
+    #[test]
+    fn avatar_colors_are_stable_per_email_and_spread_over_the_palette() {
+        assert_eq!(
+            avatar_color("Alice@Example.test"),
+            avatar_color("alice@example.test")
+        );
+        let used: std::collections::BTreeSet<_> = (0..60)
+            .map(|n| avatar_color(&format!("person{n}@example.test")))
+            .collect();
+        assert_eq!(used.len(), AVATAR_COLORS.len(), "{used:?}");
     }
 
     #[test]
@@ -1019,37 +1269,144 @@ mod tests {
         assert_eq!((starting.last_sync, starting.sync_label), (None, None));
     }
 
+    fn attention(reason: &str, open: bool, edit: impl FnOnce(&mut Status)) -> WorkspaceView {
+        let mut w = running(0, "A", Summary::NeedsAttention, Some(reason));
+        if let WorkspaceState::Running(Some(snapshot)) = &mut w.state {
+            snapshot.status.active_session = open.then(|| "s".into());
+            edit(&mut snapshot.status);
+        }
+        view(&[w]).remove(0)
+    }
+
     #[test]
-    fn attention_offers_finish_session_or_says_mesh_retries() {
-        let attention = |reason: &str, open: bool| {
-            let mut w = running(0, "A", Summary::NeedsAttention, Some(reason));
-            if let WorkspaceState::Running(Some(snapshot)) = &mut w.state {
-                snapshot.status.active_session = open.then(|| "s".into());
-            }
-            view(&[w]).remove(0)
-        };
+    fn attention_reasons_get_their_action_and_reassurance() {
         let dependent = attention(
             "Edits depend on a received draft and cannot be attributed safely. Bytes are saved locally.",
             true,
+            |_| {},
         );
         assert_eq!(dependent.action, Some("finish_session"));
-        assert_eq!(dependent.note, None);
-        assert!(dependent.open_session);
+        assert!(!dependent.finish_secondary, "Finish session is the primary");
+        assert_eq!(dependent.reassurance, Some(DEPENDENT_REASSURANCE));
+        let circular = attention(CIRCULAR_DEPENDENCY, true, |_| {});
+        assert_eq!(circular.reassurance, Some(DEPENDENT_REASSURANCE));
 
-        let failed = attention("Synchronization waiting: remote rejected the update", false);
-        assert_eq!((failed.action, failed.note), (None, Some(RETRY_NOTE)));
+        // US00005 AC 10: the card still says Mesh retries, now in one line.
+        let failed = attention(
+            "Synchronization waiting: remote rejected the update",
+            false,
+            |_| {},
+        );
+        assert_eq!(
+            (failed.action, failed.reassurance),
+            (None, Some(SYNC_REASSURANCE))
+        );
+        assert!(SYNC_REASSURANCE.contains("Mesh retries automatically."));
+
+        let conflicts = attention("2 unresolved conflicts", true, |s| {
+            s.unresolved_conflicts = ["a", "b"]
+                .map(|id| dispatch_mesh::status::ConflictStatus {
+                    id: id.into(),
+                    path: format!("{id}.md"),
+                    binary: false,
+                })
+                .to_vec()
+        });
+        assert_eq!(conflicts.action, Some("open_conflicts"));
+        assert_eq!(conflicts.reassurance, Some(CONFLICTS_REASSURANCE));
+        assert!(conflicts.finish_secondary, "Finish session stays available");
+        assert_eq!(conflicts.conflict_count, 2);
+        assert_eq!(conflicts.conflicts_tab, "Conflicts, 2 unresolved");
+        assert_eq!(conflicts.body.as_deref(), Some("2 unresolved conflicts"));
+        assert_eq!(conflicts.glyph, "needs-attention");
+
+        let capture = attention("Local capture waiting: access denied", true, |_| {});
+        assert_eq!(capture.reassurance, Some(CAPTURE_REASSURANCE));
+        assert_eq!(capture.action, None);
+        assert!(capture.finish_secondary, "Finish session stays available");
+
+        let summary = attention("AI summary failed: quota exceeded", false, |s| {
+            s.summary_failure = Some("AI summary failed: quota exceeded".into())
+        });
+        assert_eq!(summary.reassurance, Some(SUMMARY_REASSURANCE));
 
         for reason in [
-            "1 unresolved conflict",
-            "Local capture waiting: access denied",
-            "AI summary failed: quota exceeded",
+            "Shared history was rewritten outside Mesh; synchronization paused",
+            "Something nobody mapped",
         ] {
-            let other = attention(reason, true);
-            assert_eq!((other.action, other.note), (None, None), "{reason}");
-            assert!(other.open_session, "Finish session stays available");
+            let other = attention(reason, false, |_| {});
+            assert_eq!((other.action, other.reassurance), (None, None), "{reason}");
+            assert!(!other.finish_secondary);
         }
         let offline = view(&[running(0, "A", Summary::Offline, Some("timeout"))]).remove(0);
-        assert_eq!(offline.note, Some(OFFLINE_NOTE));
+        assert_eq!(offline.reassurance, Some(OFFLINE_NOTE));
+    }
+
+    #[test]
+    fn working_states_explain_themselves_and_offer_finish_session() {
+        let state = |summary, edit: &dyn Fn(&mut Status)| {
+            let mut w = running(0, "A", summary, None);
+            if let WorkspaceState::Running(Some(snapshot)) = &mut w.state {
+                edit(&mut snapshot.status);
+            }
+            view(&[w]).remove(0)
+        };
+        let open = |s: &mut Status| s.active_session = Some("s".into());
+        let saved = state(Summary::SavedLocally, &open);
+        assert_eq!(saved.body.as_deref(), Some(SAVED_BODY));
+        assert!(saved.finish_secondary && saved.action.is_none());
+        assert_eq!(saved.glyph, "working");
+        let local = state(Summary::SavedLocally, &|s| {
+            open(s);
+            s.has_remote = false
+        });
+        assert_eq!(local.body.as_deref(), Some(SAVED_LOCAL_BODY));
+        let draft = state(Summary::DraftUploaded, &open);
+        assert_eq!(draft.body.as_deref(), Some(DRAFT_BODY));
+        assert!(draft.finish_secondary);
+
+        let finishing = |own: usize, other: usize| {
+            state(Summary::WaitingForFinalization, &|s| {
+                for n in 0..own {
+                    s.sessions.push(session(
+                        &format!("own{n}"),
+                        Stage::WaitingForFinalization,
+                        1,
+                    ));
+                }
+                for n in 0..other {
+                    let mut received = session(&format!("in{n}"), Stage::WaitingForFinalization, 1);
+                    received.device = "other".into();
+                    s.sessions.push(received);
+                }
+            })
+            .body
+            .unwrap()
+        };
+        assert_eq!(
+            finishing(1, 2),
+            "Adding your finished session to shared history."
+        );
+        assert_eq!(
+            finishing(3, 0),
+            "Adding your 3 finished sessions to shared history."
+        );
+        let synced = state(Summary::Synced, &|_| {});
+        assert!(!synced.finish_secondary && synced.reassurance.is_none());
+    }
+
+    #[test]
+    fn the_conflicts_tab_shows_a_placeholder_until_conflict_review() {
+        assert_eq!(conflicts_placeholder(0), "No unresolved conflicts.");
+        assert_eq!(
+            conflicts_placeholder(1),
+            "1 unresolved conflict. Review them with the command line until conflict review arrives."
+        );
+        let none = view(&[running(0, "A", Summary::Synced, None)]).remove(0);
+        assert_eq!(
+            (none.conflict_count, none.conflicts_tab.as_str()),
+            (0, "Conflicts, 0 unresolved")
+        );
     }
 
     #[test]
