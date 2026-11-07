@@ -12,6 +12,16 @@ pub struct Git {
     pub dir: PathBuf,
 }
 
+/// Who made a commit and when, with the blob a path holds in it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct CommitInfo {
+    pub author: Identity,
+    /// Commit time, Unix seconds.
+    pub time: u64,
+    /// The blob at the queried path; `None` when the commit deleted it.
+    pub blob: Option<String>,
+}
+
 /// Why a Git process failed, derived from its stderr without ever exposing that text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GitFailureKind {
@@ -302,6 +312,56 @@ impl Git {
             .into_iter()
             .map(|(path, blob)| Ok((path, self.read_blob(&blob, 128 * 1024 * 1024)?)))
             .collect()
+    }
+
+    /// The Git object id `data` would have as a blob here, without storing it.
+    pub fn blob_id(&self, data: &[u8]) -> Result<String> {
+        Ok(
+            String::from_utf8(self.run(&["hash-object", "--stdin"], Some(data))?)?
+                .trim()
+                .to_string(),
+        )
+    }
+
+    /// The newest commit reachable from `reference` that changed `path`, and
+    /// the id of the blob at `path` in it (`None` when that commit deleted
+    /// the file). `None` for a path no commit touched. Read-only.
+    pub fn last_commit(&self, reference: &str, path: &str) -> Result<Option<CommitInfo>> {
+        validate_path(path)?;
+        let mut command = self.command();
+        command.args([
+            "--literal-pathspecs",
+            "log",
+            "-1",
+            "--format=%an%x00%ae%x00%ct%x00%H",
+            reference,
+            "--",
+            path,
+        ]);
+        let output = self.execute(&mut command, None).context("Git log")?;
+        let output = String::from_utf8(output)?;
+        let fields: Vec<_> = output.trim_end().split('\0').collect();
+        let [name, email, time, commit] = fields.as_slice() else {
+            return Ok(None);
+        };
+        validate_oid(commit)?;
+        let blob = self
+            .text(&[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{commit}:{path}"),
+            ])
+            .ok()
+            .filter(|object| validate_oid(object).is_ok());
+        Ok(Some(CommitInfo {
+            author: Identity {
+                name: (*name).to_string(),
+                email: (*email).to_string(),
+            },
+            time: time.parse().unwrap_or_default(),
+            blob,
+        }))
     }
 
     pub fn read_blob(&self, object: &str, limit: u64) -> Result<Vec<u8>> {

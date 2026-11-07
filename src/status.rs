@@ -60,11 +60,45 @@ pub struct SessionStatus {
     pub purposes: Vec<String>,
 }
 
+/// One person's contribution to a version in a conflict (US00006).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Contributor {
+    pub author: Identity,
+    /// The device the contributing session was made on; compare with
+    /// [`Status::device`]. Empty when the session record is not at hand.
+    pub device: String,
+    /// When that session last saved the conflicting file.
+    pub last_saved: u64,
+    /// Requested purposes of the session's intents that cover the file.
+    pub purposes: Vec<String>,
+}
+
+/// One version of a conflicting file, as the list reads it. Computed from
+/// committed state only: no Git, no file content.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ConflictSide {
+    /// Who made this version, newest save first. Several when drafts of
+    /// different sessions were combined into the version in the folder.
+    pub contributors: Vec<Contributor>,
+    /// The version came from shared history: no session contributed to it.
+    pub shared_history: bool,
+    /// The version is a deletion of the file.
+    pub deleted: bool,
+    /// Bytes in the version; `0` for a deletion.
+    pub size: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ConflictStatus {
     pub id: String,
     pub path: String,
     pub binary: bool,
+    /// When the conflict was recorded.
+    pub created_at: u64,
+    /// The version in the folder (the engine's `accepted`).
+    pub current: ConflictSide,
+    /// The version kept aside (the engine's `incoming`).
+    pub other: ConflictSide,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -153,14 +187,7 @@ impl Workspace {
             changes_waiting: local_changes_waiting,
             capture_error,
         } = local;
-        let unresolved: Vec<_> = self
-            .unresolved()
-            .map(|c| ConflictStatus {
-                id: c.id.clone(),
-                path: c.path.clone(),
-                binary: c.binary,
-            })
-            .collect();
+        let unresolved: Vec<_> = self.unresolved().map(|c| self.conflict_status(c)).collect();
         let own_stages: Vec<_> = self
             .state
             .manifest
@@ -275,7 +302,16 @@ impl Workspace {
 /// carry whole seconds, so purposes recorded within one second are ordered by
 /// their text, never by their random ids.
 fn purposes(session: &Session) -> Vec<String> {
-    let mut intents: Vec<_> = session.intents.values().collect();
+    purposes_covering(session, None)
+}
+
+/// [`purposes`], limited to the intents whose paths include `path` when given.
+pub(crate) fn purposes_covering(session: &Session, path: Option<&str>) -> Vec<String> {
+    let mut intents: Vec<_> = session
+        .intents
+        .values()
+        .filter(|intent| path.is_none_or(|path| intent.paths.contains(path)))
+        .collect();
     intents.sort_by(|a, b| (a.created_at, &a.purpose).cmp(&(b.created_at, &b.purpose)));
     let mut purposes: Vec<String> = Vec::new();
     for intent in intents {

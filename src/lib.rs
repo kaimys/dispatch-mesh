@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod codec;
+pub mod conflicts;
 pub mod engine;
 pub mod git;
 pub mod model;
