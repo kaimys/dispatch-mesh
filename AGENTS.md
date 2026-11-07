@@ -77,6 +77,6 @@ Explain what changed, why, and how it was verified. Distinguish local automated 
 
 ## Dispatch ticket workflows
 
-Tickets live in the Obsidian vault at `dispatch/wiki` and are worked through the Dispatch board. For any ticket work, read `dispatch/invariants.md` first. The canonical workflows are `dispatch/workflow/*.md`. Codex invokes them as `$refine <id>`, `$develop <id>` and so on through the stubs in `.codex/skills/`, and Claude Code invokes them through `.claude/commands/`.
+Tickets live in the Obsidian vault at `dispatch/wiki` and are worked through the Dispatch board. For any ticket work, read `dispatch/invariants.md` first. The canonical workflows are `dispatch/workflow/*.md`. Codex invokes them as `$refine <id>`, `$develop <id>` and so on through the stubs in `.codex/skills/`, and Claude Code invokes them through `.claude/commands/`. `orchestrate <goal>` plans a multi-ticket run, has the human confirm it, then drives the tickets through develop, code review and test plan with two subagents: canonical instructions in `dispatch/agents/`, stubs with model and effort in `.codex/agents/` and `.claude/agents/`.
 
 Codex-specific: `.codex/hooks.json` wires the Dispatch run-lifecycle hooks. Codex runs them only after you accept the hook-trust prompt in an interactive `codex` session. Editing that file un-trusts the changed entries, so re-accept the prompt afterwards.

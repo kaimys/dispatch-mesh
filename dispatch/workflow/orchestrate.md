@@ -10,12 +10,25 @@ Tracker: none. Chat: none.
 
 Steers tickets through `develop → code review (bounded) → test plan` until the goal in `<ARGS>` is reached. It runs in two phases: **plan** (read-only, ends with the human's confirmation) and **run**. **This session is the orchestrator only:** it plans, selects tickets, cuts branches, launches subagents, reads their results and the ticket frontmatter, asks the human, and decides the next step. It never edits code, tests or tickets itself, and it never reviews.
 
-| Role | Agent | Fresh context | Model / effort |
+| Role | Agent | Instructions | Model / effort |
 |---|---|---|---|
-| Development, fix rounds, test plan | `dispatch-developer` | every launch | as in `.claude/agents/dispatch-developer.md` |
-| Code review | `dispatch-reviewer` | every launch | as in `.claude/agents/dispatch-reviewer.md` (stronger model, more effort) |
+| Development, fix rounds, test plan | `dispatch-developer` | `dispatch/agents/developer.md` | Claude Code: `.claude/agents/dispatch-developer.md`; Codex: `.codex/agents/dispatch-developer.toml` |
+| Code review | `dispatch-reviewer` | `dispatch/agents/reviewer.md` | Claude Code: `.claude/agents/dispatch-reviewer.md`; Codex: `.codex/agents/dispatch-reviewer.toml` (stronger model or more effort than the developer) |
 
-Every launch is a new subagent, so the reviewer is never the author and each fix round is a different session from the review it answers, as `develop.md` and `code-review.md` require.
+Every launch is a new subagent, never a continued one, so the reviewer is never the author and each fix round is a different session from the review it answers, as `develop.md` and `code-review.md` require. Launch the named custom agent, not a generic one: the agent's own instructions and model come from its definition, and the brief carries only the ticket-specific facts the agent file lists.
+
+### Tool notes
+
+The steps below are tool-neutral. Where they need a tool-specific mechanism:
+
+| Step | Claude Code | Codex |
+|---|---|---|
+| Ask the human a discrete question | `AskUserQuestion` | ask in the conversation, numbered options with the recommendation first, and end the turn |
+| Run the session in the run worktree | `EnterWorktree` with `path` | Codex cannot switch the session's directory: start the session in the run worktree (`codex -C <run worktree>`) for the run phase, or, if it already runs elsewhere, prefix every command with `cd <run worktree> &&` and pass the path in every brief |
+| Launch a subagent | `Agent` with `subagent_type` | spawn the custom agent by name |
+| Wait for it | the completion notification wakes you; do not poll | wait for the agent's result before the next step |
+
+Subagents inherit the session's permissions. A run with frequent approval prompts stalls; say in the plan which permission mode the run needs.
 
 ## Bounds
 
@@ -41,14 +54,14 @@ Read-only. Before the human confirms, create no worktree, branch or commit, laun
    - **Goal as understood:** the selection rule and the terminal stage, in one or two lines.
    - **Tickets in order:** id, title, rank, branch name, size from its plan; then the skipped tickets with the reason.
    - **Stack:** `<first base> ← <branch 1> ← <branch 2> …`, and why this order (rank, or a dependency that overrides it).
-   - **Settings:** `max_reviews` (default 3), mode `attended` (default: ask the human at decision points) or `unattended` (mark blocked and carry on), the models per role, and the agent budget from *Bounds* (per ticket and in total).
+   - **Settings:** `max_reviews` (default 3), mode `attended` (default: ask the human at decision points) or `unattended` (mark blocked and carry on), the agent tool and the models per role, the permission mode the run needs, and the agent budget from *Bounds* (per ticket and in total).
    - **Caveats and risks**, concrete and specific to this run, each with its consequence and mitigation. Look at least for: tickets whose plans touch the same files; a ticket that depends on one outside the run or later in the stack; unmerged branches (including the human's own work in progress) that touch the same code and will conflict at merge time; tickets needing a human or the running app to verify (the agents cannot judge visuals — that lands in the test plan); plans that are stale against the code; very large plans; long Windows test times and a cold `target/` in the new worktree; that ticket edits land in the live, synchronized vault immediately; and that a blocked ticket mid-stack holds up the merge of every branch above it.
    - **Questions**, if any: only what the plan genuinely depends on.
-7. **Ask, then wait.** Put discrete questions to the human with `AskUserQuestion` (self-contained, options with a recommendation first); open-ended ones in prose. Then end the turn and wait for an explicit confirmation of the plan. Changes requested by the human are folded into the plan and shown again; the run starts only on a clear "go" for the plan as last shown.
+7. **Ask, then wait.** Put discrete questions to the human (see *Tool notes*; self-contained, options with a recommendation first); open-ended ones in prose. Then end the turn and wait for an explicit confirmation of the plan. Changes requested by the human are folded into the plan and shown again; the run starts only on a clear "go" for the plan as last shown.
 
 ## Asking the human
 
-In `attended` mode the orchestrator stops and asks — with `AskUserQuestion`, naming the ticket and the finding or question so the dialog stands on its own — when:
+In `attended` mode the orchestrator stops and asks — naming the ticket and the finding or question so the dialog stands on its own — when:
 
 - a reviewer reports `decision_needed: yes`, or a developer reports `blocked` on a question;
 - the review loop stops with blocking findings left (cap reached or no progress). Options: *one more fix round and re-check* (at most once per ticket), *accept named findings as non-blocking* (a human ruling), *leave the ticket blocked and continue*, *stop the run*;
@@ -64,7 +77,7 @@ The run never commits in the checkout the human works in.
 
 8. Create a dedicated worktree beside the repository, detached at the first base: `git worktree add --detach ../<repo>-run-<YYYYMMDD> <base>`. If it exists from an interrupted run, reuse it (see *Resume*).
 9. `dispatch/wiki` is a git-ignored junction to the vault, so a new worktree lacks it. Create the same link in the run worktree, pointing at the target the main checkout's link resolves to (Windows: `cmd //c mklink /J dispatch\wiki <target>`; elsewhere `ln -s`).
-10. Switch this session into the run worktree (`EnterWorktree` with `path`), so every subagent works there. Pass its absolute path in every brief as well.
+10. Move this session into the run worktree (see *Tool notes*), so every subagent works there. Pass its absolute path in every brief as well.
 11. **First base:** the default branch, fresh. `git fetch origin`, then use `main` if `origin/main` is its ancestor, `origin/main` if `main` is its ancestor, and ask if they diverged. A confirmed plan that names a starting branch overrides this. If the base moved since the plan was confirmed, say so before cutting the first branch.
 
 ### Per ticket, in order
@@ -72,7 +85,7 @@ The run never commits in the checkout the human works in.
 Keep a run table in your context: ticket, branch, base, review rounds, blocking counts per round, head sha, outcome.
 
 12. **Cut the branch.** `git switch -c <id lowercase>-<short-slug> <base>`. The base is the previous ticket's branch, or the first base for the first ticket. Each branch builds on the last, so the stack merges without conflicts in order. A previous ticket that ended blocked still serves as the base; its state is in the report.
-13. **Develop.** Launch `dispatch-developer` with task `develop`, the ticket, worktree, branch and base. Wait for its notification.
+13. **Develop.** Launch `dispatch-developer` with task `develop`, the ticket, worktree, branch and base. Wait for its result.
     - `outcome: blocked`, or `<base>..HEAD` has no commits: ask (attended) or mark **blocked at development** (unattended). A ticket that stays blocked adds nothing to the stack; delete its branch if it has no commits and continue on the same base.
 14. **Review loop**, `round` from 1 to `max_reviews`:
     1. Launch `dispatch-reviewer` with the ticket, worktree, branch, base, round and — from round 2 — the commit the previous review saw, so it can scope itself to the fix diff. Wait.
@@ -86,7 +99,7 @@ Keep a run table in your context: ticket, branch, base, review rounds, blocking 
 15. **Test plan**, only with `open_findings: 0` and when the terminal stage includes it: launch `dispatch-developer` with task `test-plan`. Wait. Confirm in the ticket that `open_tests` is set, `frozen` is stamped and the status is `Review`; otherwise ask or mark **blocked at test plan**.
 16. Record the outcome, the final head sha and the rounds in the run table, and post one line of progress (`US00006 → Review, 2 rounds, 5 tests`). The next ticket's base is this branch.
 
-Launch one subagent at a time and wait for it: every step depends on the previous step's commits and ticket state. Do not poll; the completion notification wakes you. Never act on a result you have not received.
+Launch one subagent at a time and wait for it: every step depends on the previous step's commits and ticket state. Never act on a result you have not received.
 
 ## Finish
 
