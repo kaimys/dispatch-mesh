@@ -865,6 +865,68 @@ async fn excluded_files_are_described_without_their_text_even_when_text_sharing_
     thread.join().unwrap();
 }
 
+#[tokio::test]
+async fn text_too_large_for_the_input_cap_is_left_out_file_by_file() {
+    let (url, receiver, thread) =
+        serve(r#"{"title":"Rework the guide","description":"Edit the guide and its exports."}"#);
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = Workspace::init(
+        temp.path(),
+        Identity {
+            name: "Alice".into(),
+            email: "alice@example.test".into(),
+        },
+        None,
+        "main".into(),
+    )
+    .unwrap();
+    let mut config = workspace.config.clone();
+    config.provider = Some(ProviderConfig {
+        base_url: url,
+        model: "test".into(),
+        api_key_env: None,
+        json_mode: true,
+        send_text: true,
+    });
+    let mut session = session();
+    // Each export fits under the 512 KiB cap alone, but not both together.
+    for (path, size) in [
+        ("export-small.html", 300 * 1024),
+        ("export-large.html", 400 * 1024),
+    ] {
+        session.changes.insert(
+            path.into(),
+            Change {
+                base: Some(vec![b'a'; size]),
+                content: None,
+                intent: None,
+                last_edit: now(),
+            },
+        );
+    }
+    let (message, failure) = ai::generate_with_failure(&config, &session).await;
+    assert_eq!(message.title, "Rework the guide");
+    assert_eq!(failure, None);
+    let request = receiver.recv().unwrap();
+    let text = request["messages"][1]["content"].as_str().unwrap();
+    assert!(text.len() <= 512 * 1024, "{}", text.len());
+    let payload: Value = serde_json::from_str(text).unwrap();
+    let changes = payload["changes"].as_array().unwrap();
+    let find = |path: &str| changes.iter().find(|c| c["path"] == path).unwrap();
+    let guide = find("guide.md");
+    assert_eq!(guide["content_available"], true);
+    assert_eq!(guide["after"], "confidential sample text");
+    let small = find("export-small.html");
+    assert_eq!(small["content_available"], true);
+    assert_eq!(small["before"].as_str().unwrap().len(), 300 * 1024);
+    let large = find("export-large.html");
+    assert_eq!(large["operation"], "deleted");
+    assert_eq!(large["before_bytes"], 400 * 1024);
+    assert_eq!(large["content_available"], false);
+    assert!(large.get("before").is_none() && large.get("after").is_none());
+    thread.join().unwrap();
+}
+
 /// A local-only workspace with one closed session waiting for its summary,
 /// summarized by the mock provider at `url`.
 fn closed_session_with_provider(temp: &Path, url: String) -> (PathBuf, String) {

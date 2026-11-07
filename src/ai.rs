@@ -198,6 +198,9 @@ pub fn retry_after_seconds(value: &str, now_unix: u64) -> Option<u64> {
     http_date_unix(value, now_unix).map(|date| date.saturating_sub(now_unix))
 }
 
+/// Largest serialized summary input sent to a provider.
+const SUMMARY_INPUT_LIMIT: usize = 512 * 1024;
+
 const SHORT_DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const LONG_DAYS: [&str; 7] = [
     "Monday",
@@ -360,24 +363,54 @@ impl Summarizer for ChatCompletions {
             } else {
                 None
             };
-            let changes: Vec<Value> = session.changes.iter().map(|(path, change)| {
+            // Shareable text per change index, with the bytes it adds to the payload.
+            let mut texts: Vec<(usize, usize, Value)> = Vec::new();
+            let mut changes: Vec<Value> = Vec::new();
+            for (index, (path, change)) in session.changes.iter().enumerate() {
                 let operation = operation(session, path, change);
                 // An excluded file is described by its operation alone; its old text says nothing about this session.
-                let text_allowed = self.config.send_text && operation != "excluded" && !binary(&change.base) && !binary(&change.content);
+                let text_allowed = self.config.send_text
+                    && operation != "excluded"
+                    && !binary(&change.base)
+                    && !binary(&change.content);
                 let mut item = json!({"path": path, "operation": operation, "before_exists": change.base.is_some(), "after_exists": change.content.is_some(),
-                    "before_bytes": change.base.as_ref().map(Vec::len), "after_bytes": change.content.as_ref().map(Vec::len), "content_available": text_allowed});
+                    "before_bytes": change.base.as_ref().map(Vec::len), "after_bytes": change.content.as_ref().map(Vec::len), "content_available": false});
                 if text_allowed {
-                    item["before"] = json!(change.base.as_ref().and_then(|v| std::str::from_utf8(v).ok()));
-                    item["after"] = json!(change.content.as_ref().and_then(|v| std::str::from_utf8(v).ok()));
+                    let text = json!({
+                        "before": change.base.as_ref().and_then(|v| std::str::from_utf8(v).ok()),
+                        "after": change.content.as_ref().and_then(|v| std::str::from_utf8(v).ok()),
+                    });
+                    // The object's braces stand in for the separating commas; "true" is shorter than "false".
+                    texts.push((index, serde_json::to_vec(&text)?.len(), text));
                 }
                 if self.config.send_text {
-                    item["recorded_intent"] = json!(change.intent.as_ref().and_then(|id| session.intents.get(id)).map(|i| &i.purpose));
+                    item["recorded_intent"] = json!(
+                        change
+                            .intent
+                            .as_ref()
+                            .and_then(|id| session.intents.get(id))
+                            .map(|i| &i.purpose)
+                    );
                 }
-                item
-            }).collect();
+                changes.push(item);
+            }
+            // The cap bounds what reaches the provider. Text that doesn't fit is
+            // left out file by file, smallest first, instead of failing the session.
+            let mut size = serde_json::to_vec(&json!({"session_id": session.id, "snapshot_hash": session.snapshot_hash(), "changes": changes}))?.len();
+            texts.sort_by_key(|(_, bytes, _)| *bytes);
+            for (index, bytes, text) in texts {
+                if size + bytes > SUMMARY_INPUT_LIMIT {
+                    break;
+                }
+                size += bytes;
+                let item = &mut changes[index];
+                item["content_available"] = json!(true);
+                item["before"] = text["before"].clone();
+                item["after"] = text["after"].clone();
+            }
             let payload = json!({"session_id": session.id, "snapshot_hash": session.snapshot_hash(), "changes": changes});
             ensure!(
-                serde_json::to_vec(&payload)?.len() <= 512 * 1024,
+                serde_json::to_vec(&payload)?.len() <= SUMMARY_INPUT_LIMIT,
                 "Summary input exceeds preview limit; using a factual local message"
             );
             let mut body = json!({"model": self.config.model, "stream": false, "messages": [
