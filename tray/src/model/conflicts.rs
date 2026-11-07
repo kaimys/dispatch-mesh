@@ -1346,10 +1346,23 @@ pub(super) mod tests {
 
     #[test]
     fn a_pathological_file_cannot_hang_the_comparison() {
-        // Many distinct lines on both sides, interleaved: a worst case for an
-        // exact diff. The view still arrives, within the deadline plus slack.
-        let current: String = (0..40_000).map(|i| format!("a{}\n", i * 2)).collect();
-        let other: String = (0..40_000).map(|i| format!("b{}\n", i * 3)).collect();
+        // Lines drawn from a small alphabet in two unrelated pseudo-random
+        // orders: many matches, hardly any long common runs, which is a worst
+        // case for an exact diff. (All-distinct lines would be quick.) The view
+        // still arrives, within the deadline plus slack.
+        let shuffled = |seed: u64| -> String {
+            let mut state = seed;
+            (0..40_000)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    format!("line {}\n", (state >> 33) % 64)
+                })
+                .collect()
+        };
+        let current = shuffled(1);
+        let other = shuffled(2);
         let detail = detail_of(
             conflict("c", "worst.md", false),
             Some(current.as_bytes()),
@@ -1361,5 +1374,13 @@ pub(super) mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         let (left, right) = text_lines(&view);
         assert_eq!((left.len(), right.len()), (40_000, 40_000));
+        // The diff gave up, so no line is marked and the view says why.
+        assert!(left.iter().chain(right).all(|line| !line.changed));
+        match &view.body {
+            Body::Text {
+                marks_unavailable, ..
+            } => assert_eq!(*marks_unavailable, Some(MARKS_UNAVAILABLE)),
+            body => panic!("not a comparison: {body:?}"),
+        }
     }
 }

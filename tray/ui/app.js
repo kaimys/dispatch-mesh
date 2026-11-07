@@ -528,6 +528,9 @@ function conflictBody(state) {
       toggle),
     strip,
     view.body.kind === "metadata" ? el("p", { class: "detail-summary" }, view.body.reason) : null,
+    view.body.kind === "text" && view.body.marks_unavailable
+      ? el("p", { class: "detail-summary", "data-key": "marks-unavailable" }, view.body.marks_unavailable)
+      : null,
     el("div", { class: "columns" }, versionColumn(view, "current", false), versionColumn(view, "other", true)));
 }
 
