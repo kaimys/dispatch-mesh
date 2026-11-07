@@ -18,7 +18,7 @@ The current application is a Rust console preview plus a first Windows tray host
 - `src/transport.rs`: device manifests and native Git blobs.
 - `src/git.rs`: Git subprocess operations and path/object validation.
 - `src/ai.rs`: Chat Completions summaries, recorded intent, validation, and local fallback.
-- `tray/`: the `dispatch-mesh-tray` package (Tauri 2, ADR-0011/ADR-0012), a separate GUI executable in the Cargo workspace. `src/model.rs` holds all tray and window wording and state rules, `src/host.rs` runs one `RunnerHandle` per workspace, `src/tray.rs` the notification-area icon, `ui/` the static status window (no npm), `tests/host.rs` host tests with real workspaces. Icons are rendered by `scripts/tray_icons.py`.
+- `tray/`: the `dispatch-mesh-tray` package (Tauri 2, ADR-0011/ADR-0012), a separate GUI executable in the Cargo workspace. `src/model.rs` holds all tray and window wording and state rules, `src/host.rs` runs one `RunnerHandle` per workspace, `src/tray.rs` the notification-area icon, `ui/` the static status window (no npm; `ui/glyphs/` holds the status glyphs exported by the design, `ui/fonts/` the bundled IBM Plex fonts with their licence; the layout follows the wiki's *Dispatch Mesh desktop app — design spec*), `tests/host.rs` host tests with real workspaces. Icons are rendered by `scripts/tray_icons.py`.
 - `tests/`: CLI, engine, provider, and storage/transport integration tests.
 - `scripts/test_github_workflow.py`: optional live GitHub verification using isolated clients.
 - `dispatch/wiki/08_Delivery-and-QA/Reports/`: recorded verification results and known limitations (in the git-ignored wiki vault).
