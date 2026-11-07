@@ -462,6 +462,14 @@ pub struct SessionView {
     pub last_saved: u64,
     /// Line 2: the summary title once published, else the files.
     pub line: String,
+    /// Whether line 2 is the summary title, which wraps instead of being
+    /// cut off; a file list stays on one line (US00012, Kai 2026-11-07).
+    pub line_is_title: bool,
+    /// The row's tooltip: the author's full name and the changed files, one
+    /// per line (US00012, Kai 2026-11-07).
+    pub tooltip: String,
+    /// The changed files for screen readers, which don't read tooltips.
+    pub files_text: String,
     /// The requested purpose, when one is recorded ("… +N more" for several).
     pub purpose: Option<String>,
     /// The stage, named once; "Discarded" for a discarded session.
@@ -475,6 +483,21 @@ pub struct SessionView {
 }
 
 const DISCARDED: &str = "Discarded";
+/// How many files a row's tooltip lists before summing up the rest.
+pub const TOOLTIP_FILES: usize = 20;
+
+/// A session row's tooltip: who, then the changed files one per line.
+fn row_tooltip(author: &str, files: &[String]) -> String {
+    let mut lines = vec![author.to_owned(), "Changed files:".to_owned()];
+    lines.extend(files.iter().take(TOOLTIP_FILES).cloned());
+    if files.len() > TOOLTIP_FILES {
+        lines.push(format!("… and {} more", files.len() - TOOLTIP_FILES));
+    }
+    lines.join(
+        "
+",
+    )
+}
 
 fn session_view(session: &SessionStatus, has_remote: bool, this_device: &str) -> SessionView {
     let own = session.device == this_device;
@@ -489,8 +512,10 @@ fn session_view(session: &SessionStatus, has_remote: bool, this_device: &str) ->
     } else {
         (0..stages.len())
             .map(|index| match index {
-                _ if session.stage == Stage::Published => "synced",
+                // A received session keeps its pale first segment once
+                // published: this device never had it saved (review F3).
                 0 if !own => "received",
+                _ if session.stage == Stage::Published => "synced",
                 index if index <= current => "working",
                 _ => "empty",
             })
@@ -536,6 +561,9 @@ fn session_view(session: &SessionStatus, has_remote: bool, this_device: &str) ->
             .title
             .clone()
             .unwrap_or_else(|| session.files.join(", ")),
+        line_is_title: session.title.is_some(),
+        tooltip: row_tooltip(&session.author.name, &session.files),
+        files_text: format!("Changed files: {}", session.files.join(", ")),
         purpose,
         stage,
         stage_text,
@@ -704,6 +732,38 @@ pub fn view(workspaces: &[Workspace]) -> Vec<WorkspaceView> {
             }
         })
         .collect()
+}
+
+/// How to change a window's height and top so it fits a monitor's work area
+/// vertically: `None` keeps the value. All values are physical pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerticalFit {
+    pub inner_height: Option<u32>,
+    pub y: Option<i32>,
+}
+
+/// Fit a window of outer height `outer` at top `y`, with `frame` pixels of
+/// title bar and border, into the work area starting at `area_y` with height
+/// `area_height`: shorten it to the work area if taller, then move it up (or
+/// down) just enough that it lies wholly inside.
+pub fn fit_vertically(
+    y: i32,
+    outer: u32,
+    frame: u32,
+    area_y: i32,
+    area_height: u32,
+) -> VerticalFit {
+    let height = outer.min(area_height);
+    let inner_height = (height < outer).then(|| height.saturating_sub(frame));
+    let bottom = i64::from(area_y) + i64::from(area_height);
+    let top = i64::from(y)
+        .min(bottom - i64::from(height))
+        .max(i64::from(area_y));
+    let top = i32::try_from(top).unwrap_or(area_y);
+    VerticalFit {
+        inner_height,
+        y: (top != y).then_some(top),
+    }
 }
 
 #[cfg(test)]
@@ -1179,7 +1239,11 @@ mod tests {
         assert_eq!(view.avatar.initials, "A");
         assert!(view.avatar.color.starts_with('c'), "{}", view.avatar.color);
         let published = row(Stage::Published, true, "other-device");
-        assert_eq!(published.segments, vec!["synced"; 4], "published wins");
+        assert_eq!(
+            published.segments,
+            ["received", "synced", "synced", "synced"],
+            "origin stays visible after publication (review F3)"
+        );
         let own = row(Stage::DraftUploaded, true, "device");
         assert_eq!((own.author.as_str(), own.own), ("You", true));
         assert_eq!(
@@ -1233,6 +1297,28 @@ mod tests {
             (published.line.as_str(), published.files_label.as_str()),
             ("Update note", "1 file")
         );
+        assert!(published.line_is_title, "a summary title wraps");
+        assert!(!view.line_is_title, "a file list stays on one line");
+    }
+
+    #[test]
+    fn the_row_tooltip_names_the_author_and_lists_the_changed_files() {
+        let mut received = session("bob", Stage::Published, 300);
+        received.author.name = "Bob Berger".into();
+        received.files = vec!["a.md".into(), "docs/b.md".into()];
+        let view = session_view(&received, true, "device");
+        assert_eq!(
+            view.tooltip,
+            "Bob Berger
+Changed files:
+a.md
+docs/b.md"
+        );
+        assert_eq!(view.files_text, "Changed files: a.md, docs/b.md");
+        received.files = (0..25).map(|n| format!("f{n}.md")).collect();
+        let long = session_view(&received, true, "device").tooltip;
+        assert_eq!(long.lines().count(), 2 + TOOLTIP_FILES + 1);
+        assert!(long.ends_with("… and 5 more"), "{long}");
     }
 
     #[test]
@@ -1343,6 +1429,15 @@ mod tests {
         }
         let offline = view(&[running(0, "A", Summary::Offline, Some("timeout"))]).remove(0);
         assert_eq!(offline.reassurance, Some(OFFLINE_NOTE));
+        assert!(!offline.finish_secondary, "no session open");
+        // Plan amendment / AC 2 as reconciled: an open session can be
+        // finished while offline too.
+        let mut open_offline = running(0, "A", Summary::Offline, Some("timeout"));
+        if let WorkspaceState::Running(Some(snapshot)) = &mut open_offline.state {
+            snapshot.status.active_session = Some("s".into());
+        }
+        let open_offline = view(&[open_offline]).remove(0);
+        assert!(open_offline.finish_secondary && open_offline.action.is_none());
     }
 
     #[test]
@@ -1480,6 +1575,50 @@ mod tests {
         }
         assert!(contrast("#FFFFFF", YOU_COLOR) >= 4.5);
         assert!(css.contains(&format!(".avatar.you {{ background: {YOU_COLOR}; }}")));
+    }
+
+    #[test]
+    fn a_window_is_shortened_and_moved_to_stay_inside_the_work_area() {
+        // Fits: nothing changes.
+        assert_eq!(
+            fit_vertically(100, 1000, 40, 0, 1400),
+            VerticalFit {
+                inner_height: None,
+                y: None
+            }
+        );
+        // Review F2: taller than a short work area and 40 px below its top.
+        assert_eq!(
+            fit_vertically(40, 1000, 40, 0, 900),
+            VerticalFit {
+                inner_height: Some(860),
+                y: Some(0)
+            }
+        );
+        // Fits in height but runs past the bottom: moved up only.
+        assert_eq!(
+            fit_vertically(600, 1000, 40, 0, 1400),
+            VerticalFit {
+                inner_height: None,
+                y: Some(400)
+            }
+        );
+        // A work area that doesn't start at 0 (taskbar on top, second monitor).
+        assert_eq!(
+            fit_vertically(-500, 1000, 40, -1080, 1040),
+            VerticalFit {
+                inner_height: None,
+                y: Some(-1040)
+            }
+        );
+        // Above the work area: moved down to its top.
+        assert_eq!(
+            fit_vertically(-20, 600, 40, 0, 1400),
+            VerticalFit {
+                inner_height: None,
+                y: Some(0)
+            }
+        );
     }
 
     #[test]

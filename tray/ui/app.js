@@ -173,18 +173,22 @@ function card(ws) {
 // eye only; screen readers hear the stage once, as "Stage: …, 2 of 4".
 function sessionItem(session) {
   const meta = `${session.files_label} · started ${at(session.started_at)} · last saved ${ago(session.last_saved)}`;
-  return el("li", { class: "session" },
+  // The row's tooltip names the author and lists the changed files; screen
+  // readers get the files as text, since they don't read tooltips.
+  return el("li", { class: "session", title: session.tooltip },
     el("div", { class: `avatar ${session.avatar.color}`, "aria-hidden": "true" }, session.avatar.initials),
     el("div", { class: "session-body" },
       el("p", { class: "line1" },
-        el("span", { class: "author" }, session.author),
-        el("span", { class: "meta ellipsis", title: meta }, meta)),
-      el("p", { class: "line2 ellipsis", title: session.line }, session.line),
-      session.purpose ? el("p", { class: "purpose ellipsis", title: session.purpose }, session.purpose) : null,
+        el("span", { class: "author ellipsis" }, session.author),
+        el("span", { class: "meta ellipsis" }, meta)),
+      // A summary title wraps; a file list stays on one line.
+      el("p", { class: session.line_is_title ? "line2 title" : "line2 ellipsis" }, session.line),
+      session.line_is_title ? el("span", { class: "visually-hidden" }, session.files_text) : null,
+      session.purpose ? el("p", { class: "purpose ellipsis" }, session.purpose) : null,
       el("div", { class: "line3" },
         session.discarded
           ? el("span", { class: "tag", "aria-hidden": "true" }, session.stage)
-          : el("span", { class: "track", "aria-hidden": "true" },
+          : el("span", { class: `track n${session.segments.length}`, "aria-hidden": "true" },
             ...session.segments.map((kind) => el("span", { class: `seg ${kind}` }))),
         session.discarded ? null : el("span", { class: "stage", "aria-hidden": "true" }, session.stage),
         el("span", { class: "visually-hidden" }, session.stage_text))));

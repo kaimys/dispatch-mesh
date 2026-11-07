@@ -90,22 +90,32 @@ pub fn show_window(app: &AppHandle) {
     }
 }
 
-/// The window opens at 440 × 640 (US00012 Q7); on a screen shorter than
-/// that, it takes the work area's height instead of running off screen.
+/// The window opens at 440 × 640 (US00012 Q7). On a screen shorter than
+/// that, or where it would run past the work area's bottom, it is shortened
+/// and moved up so it stays whole (see [`model::fit_vertically`]).
 fn fit_to_work_area(window: &tauri::WebviewWindow) {
-    let (Ok(Some(monitor)), Ok(outer), Ok(inner)) = (
+    let (Ok(Some(monitor)), Ok(position), Ok(outer), Ok(inner)) = (
         window.current_monitor(),
+        window.outer_position(),
         window.outer_size(),
         window.inner_size(),
     ) else {
         return;
     };
-    let available = monitor.work_area().size.height;
-    if outer.height > available {
+    let area = monitor.work_area();
+    let fit = model::fit_vertically(
+        position.y,
+        outer.height,
+        outer.height - inner.height,
+        area.position.y,
+        area.size.height,
+    );
+    if let Some(height) = fit.inner_height {
         // `set_size` sets the inner size; the title bar and frame stay.
-        let frame = outer.height - inner.height;
-        let height = available.saturating_sub(frame);
         let _ = window.set_size(tauri::PhysicalSize::new(inner.width, height));
+    }
+    if let Some(y) = fit.y {
+        let _ = window.set_position(tauri::PhysicalPosition::new(position.x, y));
     }
 }
 

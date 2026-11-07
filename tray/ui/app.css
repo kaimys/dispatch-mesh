@@ -126,12 +126,19 @@ button:disabled { opacity: .6; cursor: default; }
 .avatar.c5 { background: #0E6E7E; }
 .session-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 1; }
 .line1 { display: flex; gap: 6px; align-items: baseline; min-width: 0; }
-.author { font-weight: 600; flex: none; }
+/* The author shrinks and ellipsizes, but never below its share: the meta
+   keeps room for the file count and times (review F1). */
+.author { font-weight: 600; flex: 0 1 auto; max-width: 55%; }
+.line1 .meta { flex: 1 1 0; }
+.line2.title { overflow-wrap: anywhere; }
 .meta { font-size: 12px; color: var(--text-3); }
 .purpose { font-size: 12px; color: var(--text-3); }
 .line3 { display: flex; align-items: center; gap: 8px; }
+/* 28 px per segment including the 3 px gap: 112 px for four, 84 px for three. */
 .track { display: flex; gap: 3px; flex: none; }
-.seg { width: 25px; height: 4px; border-radius: 2px; background: var(--line); }
+.track.n4 { width: 112px; }
+.track.n3 { width: 84px; }
+.seg { flex: 1 1 0; height: 4px; border-radius: 2px; background: var(--line); }
 .seg.working { background: var(--working); }
 .seg.synced { background: var(--synced); }
 .seg.received { background: var(--received); }
