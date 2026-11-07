@@ -4,13 +4,14 @@
 
 Dispatch Mesh synchronizes folders through Git while hiding Git mechanics from end users. It tracks editing sessions, records agent intent, and preserves recoverable conflicts. Read `README.md` for the supported behavior and CLI examples before changing the engine.
 
-The current application is a Rust console preview plus a first Windows tray host in progress for 0.3 (status, session detail and Finish session). Conflict review and the rest of the tray controls, guided account/repository setup, bundled Git, and login startup are future work. macOS and Linux builds precede the authenticated cloud MCP milestone, which is deferred to version 2.0. Do not present planned features as implemented.
+The current application is a Rust console preview plus a first Windows tray host in progress for 0.3 (status, session detail, Finish session, and conflict review with whole-version choice). The rest of the tray controls, guided account/repository setup, bundled Git, and login startup are future work. macOS and Linux builds precede the authenticated cloud MCP milestone, which is deferred to version 2.0. Do not present planned features as implemented.
 
 ## Repository map
 
 - `src/main.rs`: CLI commands.
 - `src/runner.rs`: run loop shared by CLI `run` and desktop hosts: watcher, capture, synchronization scheduling, summaries, published status snapshots, and the `Runner`/`RunnerHandle` host interface.
 - `src/status.rs`: workspace status and session stages, computed without the operation lock.
+- `src/conflicts.rs`: per-conflict list metadata for `status` (who made each version, from memory only) and `Workspace::conflict_detail`, one conflict's versions and history read on demand.
 - `src/engine.rs`: workspace operations, sessions, integration, conflict resolution, and publication.
 - `src/model.rs`: configuration and durable domain types.
 - `src/storage.rs`: SQLite persistence and migration.
@@ -18,8 +19,8 @@ The current application is a Rust console preview plus a first Windows tray host
 - `src/transport.rs`: device manifests and native Git blobs.
 - `src/git.rs`: Git subprocess operations and path/object validation.
 - `src/ai.rs`: Chat Completions summaries, recorded intent, validation, and local fallback.
-- `tray/`: the `dispatch-mesh-tray` package (Tauri 2, ADR-0011/ADR-0012), a separate GUI executable in the Cargo workspace. `src/model.rs` holds all tray and window wording and state rules, `src/host.rs` runs one `RunnerHandle` per workspace, `src/tray.rs` the notification-area icon, `ui/` the static status window (no npm; `ui/glyphs/` holds the status glyphs exported by the design, `ui/fonts/` the bundled IBM Plex fonts with their licence; the layout follows the wiki's *Dispatch Mesh desktop app — design spec*), `tests/host.rs` host tests with real workspaces. Icons are rendered by `scripts/tray_icons.py`.
-- `tests/`: CLI, engine, provider, and storage/transport integration tests.
+- `tray/`: the `dispatch-mesh-tray` package (Tauri 2, ADR-0011/ADR-0012), a separate GUI executable in the Cargo workspace. `src/model.rs` holds all tray and window wording and state rules (`src/model/conflicts.rs` the conflict list and detail views, the line marks and the image-preview rule), `src/host.rs` runs one `RunnerHandle` per workspace, `src/tray.rs` the notification-area icon, `ui/` the static status window (no npm; `ui/glyphs/` holds the status glyphs exported by the design, `ui/fonts/` the bundled IBM Plex fonts with their licence; the layout follows the wiki's *Dispatch Mesh desktop app — design spec*), `tests/host.rs` host tests with real workspaces. Icons are rendered by `scripts/tray_icons.py`.
+- `tests/`: CLI, engine, conflict metadata, provider, and storage/transport integration tests.
 - `scripts/test_github_workflow.py`: optional live GitHub verification using isolated clients.
 - `dispatch/wiki/08_Delivery-and-QA/Reports/`: recorded verification results and known limitations (in the git-ignored wiki vault).
 

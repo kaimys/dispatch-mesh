@@ -16,6 +16,10 @@ const finishing = new Set(); // workspace ids whose Finish session is under way
 const errors = new Map(); // workspace id -> last failed action's message
 const copiesOpen = new Set(); // workspace ids whose saved-copies list is expanded
 const tabs = new Map(); // workspace id -> "activity" | "conflicts"
+const conflictOpen = new Map(); // workspace id -> the conflict open in detail (US00006)
+const notices = new Map(); // workspace id -> a dismissible line, like the line after a choice
+let wide = false; // whether the window is in the widened detail layout
+let lastView = ""; // identifies the view last drawn, to keep its scroll position
 
 const SVG = "http://www.w3.org/2000/svg";
 
@@ -257,10 +261,311 @@ function sectionNav(ws) {
     role: "tabpanel",
     id: `panel-${ws.id}`,
     "aria-labelledby": `tab-${current}-${ws.id}`,
-  }, ...(current === "conflicts"
-    ? [el("p", { class: "placeholder" }, ws.conflicts_placeholder)]
-    : activity(ws)));
+  }, ...(current === "conflicts" ? conflictsPanel(ws) : activity(ws)));
   return [nav, panel];
+}
+
+// ---- Conflicts (US00006; design spec, *Conflicts*) -------------------------
+
+// A time with the text that carries it: the host's text holds "{time}".
+function stamp(stamped) {
+  return stamped.time ? stamped.text.replace("{time}", at(stamped.time)) : stamped.text;
+}
+
+function when(seconds) {
+  const today = new Date().toDateString() === new Date(seconds * 1000).toDateString();
+  return today ? `today ${at(seconds)}` : at(seconds);
+}
+
+function fileIcon(image) {
+  const root = svg("svg", { viewBox: "0 0 20 20", fill: "none", stroke: "currentColor", "stroke-width": "1.4", "stroke-linejoin": "round", "aria-hidden": "true" });
+  if (image) {
+    root.append(svg("rect", { x: "3", y: "4", width: "14", height: "12", rx: "1.5" }),
+      svg("path", { d: "M3 14l4-4 3 3 3-3 4 4" }),
+      svg("circle", { cx: "7", cy: "8", r: "1.2" }));
+  } else {
+    root.append(svg("path", { d: "M5 2h7l4 4v12H5zM12 2v4h4M8 10h5M8 13h5" }));
+  }
+  return root;
+}
+
+function noticeLine(ws) {
+  const text = notices.get(ws.id);
+  if (!text) return null;
+  return el("div", { class: "notice", role: "status" },
+    el("p", {}, text),
+    el("button", {
+      "data-key": `dismiss-${ws.id}`,
+      "aria-label": "Dismiss this message",
+      onclick: () => { notices.delete(ws.id); render(); },
+    }, "×"));
+}
+
+function sideCard(side, other) {
+  return el("div", { class: other ? "side-card other" : "side-card" },
+    el("span", { class: "caps" }, side.title),
+    el("span", { class: "who" }, side.author),
+    side.saved ? el("span", { class: "when" }, `${side.verb} ${at(side.saved)}`) : null);
+}
+
+function conflictCard(ws, entry) {
+  return el("li", { class: "conflict" },
+    el("div", { class: "conflict-head" },
+      fileIcon(entry.kind.startsWith("Image")),
+      el("div", {},
+        el("p", { class: "file" }, entry.path),
+        el("p", { class: "kind" }, `${entry.kind} · recorded ${when(entry.recorded)}`))),
+    el("div", { class: "sides" }, sideCard(entry.current, false), sideCard(entry.other, true)),
+    el("button", {
+      class: "secondary",
+      "data-key": `review-${ws.id}-${entry.id}`,
+      "aria-label": entry.review_label,
+      onclick: () => { notices.delete(ws.id); openConflict(ws, entry.id); },
+    }, "Review and choose"));
+}
+
+function conflictsPanel(ws) {
+  const list = ws.conflicts;
+  return [
+    noticeLine(ws),
+    el("h2", { class: "conflicts-heading" }, list.heading),
+    el("p", { class: "conflicts-note" }, list.explanation),
+    list.entries.length
+      ? el("ul", { class: "conflict-list", "aria-label": list.heading }, ...list.entries.map((entry) => conflictCard(ws, entry)))
+      : null,
+  ];
+}
+
+async function openConflict(ws, id) {
+  closeConflict(ws.id);
+  const state = { id, view: null, error: null, busy: null, body: null, urls: [], closed: false };
+  conflictOpen.set(ws.id, state);
+  render();
+  try {
+    state.view = await invoke("conflict_detail", { id: ws.id, conflict: id });
+  } catch (error) {
+    if (state.closed) return;
+    state.error = `${error}`;
+    render();
+    focusKey("conflict-back");
+    return;
+  }
+  if (state.closed) return;
+  render();
+  focusKey("conflict-back");
+  loadPreviews(ws.id, state);
+}
+
+function closeConflict(wsId) {
+  const state = conflictOpen.get(wsId);
+  if (!state) return;
+  state.closed = true;
+  for (const url of state.urls) URL.revokeObjectURL(url);
+  conflictOpen.delete(wsId);
+}
+
+function focusKey(key) {
+  const node = app.querySelector(`[data-key="${key}"]`);
+  if (node) node.focus();
+}
+
+function backToList(ws) {
+  const id = conflictOpen.get(ws.id)?.id;
+  closeConflict(ws.id);
+  tabs.set(ws.id, "conflicts");
+  render();
+  focusKey(`review-${ws.id}-${id}`);
+}
+
+// Image previews arrive as raw bytes by conflict id and side, never a path.
+async function loadPreviews(wsId, state) {
+  for (const side of ["current", "other"]) {
+    const panel = state.view[side];
+    if (!panel.preview) continue;
+    state.body = state.body || conflictBody(state);
+    const frame = state.body.querySelector(`[data-preview="${side}"]`);
+    if (!frame) continue;
+    try {
+      const data = await invoke("conflict_preview", { id: wsId, conflict: state.id, side });
+      if (state.closed) return;
+      const url = URL.createObjectURL(new Blob([data], { type: panel.preview.mime }));
+      state.urls.push(url);
+      const image = frame.querySelector("img");
+      if (image) {
+        image.addEventListener("load", () => frame.querySelector("p")?.remove());
+        image.src = url;
+      }
+    } catch (error) {
+      if (state.closed) return;
+      const note = frame.querySelector("p");
+      if (note) note.textContent = `Couldn't load the preview: ${error}`;
+    }
+  }
+}
+
+async function choose(ws, state, choice) {
+  state.busy = choice;
+  state.error = null;
+  render();
+  try {
+    const done = await invoke("resolve_conflict", { id: ws.id, conflict: state.id, choice });
+    if (state.closed) return;
+    notices.set(ws.id, done.confirmation);
+    if (done.next) {
+      await openConflict(ws, done.next);
+    } else {
+      closeConflict(ws.id);
+      tabs.set(ws.id, "conflicts");
+      render();
+      focusKey(`tab-conflicts-${ws.id}`);
+    }
+  } catch (error) {
+    if (state.closed) return;
+    state.busy = null;
+    state.error = `${error}`;
+    render();
+    // The buttons follow the latest state: a later save shows its note.
+    refreshNote(ws.id, state);
+  }
+}
+
+// Read the open conflict again for a save made after it was recorded, so the
+// note and the buttons follow the folder. Only the note changes; the versions
+// shown stay as they were loaded.
+async function refreshNote(wsId, state) {
+  if (state.closed || state.busy !== null || !state.view || state.refreshing) return;
+  state.refreshing = true;
+  try {
+    const fresh = await invoke("conflict_detail", { id: wsId, conflict: state.id });
+    const before = state.view.note ? state.view.note.time : null;
+    const after = fresh.note ? fresh.note.time : null;
+    if (!state.closed && state.busy === null && before !== after) {
+      state.view.note = fresh.note;
+      state.view.can_choose = fresh.can_choose;
+      render();
+    }
+  } catch (error) {
+    // A conflict that is gone from the list is handled by render().
+  }
+  state.refreshing = false;
+}
+
+function codeColumn(panel, lines) {
+  return el("div", { class: "code", tabindex: "0", role: "region", "aria-label": `${panel.title}, ${lines.length} lines` },
+    ...lines.map((line) => el("div", { class: line.changed ? "line changed" : "line" },
+      el("span", { class: "num", "aria-hidden": "true" }, String(line.number)),
+      line.changed
+        ? el("span", { class: "mark", role: "img", "aria-label": panel.differs_label }, "≠")
+        : el("span", { class: "mark" }),
+      el("span", {}, line.text))));
+}
+
+function versionColumn(view, side, other) {
+  const panel = view[side];
+  const body = view.body;
+  let content;
+  if (panel.placeholder) {
+    content = el("p", { class: "placeholder-box" }, stamp(panel.placeholder));
+  } else if (body.kind === "text") {
+    content = codeColumn(panel, body[side]);
+  } else {
+    content = [
+      el("div", { class: "preview" },
+        el("div", { class: "frame", "data-preview": side },
+          panel.preview
+            ? el("img", { alt: `Preview of the ${panel.title.toLowerCase()} of ${view.path}` })
+            : null,
+          el("p", {}, panel.preview ? "Loading preview…" : (panel.no_preview || "")))),
+      el("dl", { class: "facts" },
+        ...panel.facts.flatMap((fact) => [el("dt", {}, fact.label), el("dd", {}, stamp(fact.value))])),
+    ];
+  }
+  return el("section", { class: other ? "version other" : "version", "aria-label": panel.title },
+    el("div", { class: "version-head" },
+      el("div", { class: "version-title" },
+        el("span", { class: "caps" }, panel.title),
+        el("span", { class: "tag" }, panel.badge)),
+      el("p", { class: "byline" },
+        panel.avatar ? el("span", { class: `avatar ${panel.avatar.color}`, "aria-hidden": "true" }, panel.avatar.initials) : null,
+        el("span", {}, stamp(panel.byline))),
+      el("p", { class: "purpose-line" }, panel.purpose)),
+    ...(Array.isArray(content) ? content : [content]));
+}
+
+// The comparison itself, built once per opened conflict: a re-render for a new
+// snapshot reuses it, so long files and loaded previews are not rebuilt.
+function conflictBody(state) {
+  const view = state.view;
+  let strip = null;
+  let toggle = null;
+  if (view.base) {
+    strip = el("div", { class: "base-strip", id: "base-strip", hidden: "" },
+      el("div", { class: "head" },
+        el("span", { class: "caps" }, view.base.label),
+        el("span", {}, stamp(view.base.text))),
+      view.base.lines.length
+        ? el("div", { class: "base-text", tabindex: "0", role: "region", "aria-label": view.base.label },
+          ...view.base.lines.map((line) => el("div", {}, line.text || " ")))
+        : null);
+    toggle = el("button", {
+      class: "secondary",
+      "data-key": "toggle-base",
+      "aria-expanded": "false",
+      "aria-controls": "base-strip",
+    }, "Show common base");
+    toggle.addEventListener("click", () => {
+      const show = strip.hasAttribute("hidden");
+      strip.toggleAttribute("hidden", !show);
+      toggle.setAttribute("aria-expanded", String(show));
+      toggle.textContent = show ? "Hide common base" : "Show common base";
+    });
+  }
+  return el("div", { class: "detail-body" },
+    el("div", { class: "detail-head" },
+      el("div", {},
+        el("h1", { class: "detail-path" }, view.path),
+        el("p", { class: "detail-summary" }, view.summary)),
+      toggle),
+    strip,
+    view.body.kind === "metadata" ? el("p", { class: "detail-summary" }, view.body.reason) : null,
+    el("div", { class: "columns" }, versionColumn(view, "current", false), versionColumn(view, "other", true)));
+}
+
+function conflictDetail(ws, state) {
+  const view = state.view;
+  const top = el("div", { class: "top" },
+    el("button", { class: "crumb", "data-key": "conflict-back", onclick: () => backToList(ws) },
+      el("span", { "aria-hidden": "true" }, "‹"), "Conflicts"),
+    view ? el("span", { class: "crumb of" }, `/ ${view.position}`) : null,
+    el("span", { class: "workspace ellipsis" }, ws.name));
+  if (!view) {
+    return [el("div", { class: "detail" }, top,
+      el("div", { class: "content" },
+        state.error
+          ? el("p", { class: "error", role: "alert" }, state.error)
+          : el("p", { class: "muted" }, "Loading the conflict…")))];
+  }
+  if (!state.body) state.body = conflictBody(state);
+  const busy = state.busy !== null;
+  const button = (key, choice, label, primary) => el("button", {
+    class: primary ? "primary" : "secondary",
+    "data-key": key,
+    ...(busy || !view.can_choose ? { disabled: "" } : {}),
+    ...(state.busy === choice ? { "aria-busy": "true" } : {}),
+    ...(view.note ? { "aria-describedby": "later-edit" } : {}),
+    onclick: () => choose(ws, state, choice),
+  }, state.busy === choice ? "Choosing…" : label);
+  return [el("div", { class: "detail" }, top,
+    el("div", { class: "content" },
+      noticeLine(ws),
+      state.body,
+      view.note ? el("p", { class: "notice", id: "later-edit" }, stamp(view.note)) : null,
+      state.error ? el("p", { class: "error", role: "alert" }, state.error) : null),
+    el("div", { class: "footer" },
+      el("p", { class: "reassure" }, view.footer),
+      el("div", { class: "buttons" },
+        button("use-other", "other", view.use_label, false),
+        button("keep-current", "current", view.keep_label, true))))];
 }
 
 function topRow(several, ws) {
@@ -281,6 +586,8 @@ function topRow(several, ws) {
 }
 
 function detail(ws, several) {
+  const open = conflictOpen.get(ws.id);
+  if (open) return conflictDetail(ws, open);
   const error = errors.get(ws.id);
   const running = !(ws.already_running || ws.retry);
   return [
@@ -332,18 +639,47 @@ function announceChanges() {
   }
 }
 
+// The workspace the window shows in detail, if any.
+function shownWorkspace() {
+  if (workspaces.length === 1) return workspaces[0];
+  return workspaces.find((w) => w.id === selected) || null;
+}
+
+// A conflict that left the list while open was settled elsewhere.
+function closeGoneConflicts() {
+  for (const [wsId, state] of [...conflictOpen]) {
+    const ws = workspaces.find((w) => w.id === wsId);
+    if (!ws) {
+      closeConflict(wsId);
+    } else if (state.busy === null && !ws.conflicts.entries.some((entry) => entry.id === state.id)) {
+      closeConflict(wsId);
+      notices.set(wsId, ws.conflicts.resolved_elsewhere);
+      tabs.set(wsId, "conflicts");
+    }
+  }
+}
+
 function render() {
+  closeGoneConflicts();
   const several = workspaces.length > 1;
+  const shown = shownWorkspace();
   let content;
   if (workspaces.length === 0) content = empty();
   else if (!several) content = detail(workspaces[0], false);
-  else {
-    const ws = workspaces.find((w) => w.id === selected);
-    content = ws ? detail(ws, true) : list();
+  else content = shown ? detail(shown, true) : list();
+  // The window widens for conflict detail and returns to its compact size on Back.
+  const open = shown ? conflictOpen.get(shown.id) : null;
+  if (Boolean(open) !== wide) {
+    wide = Boolean(open);
+    invoke("set_layout", { layout: wide ? "detail" : "compact" }).catch(() => {});
   }
+  const viewKey = `${shown ? shown.id : "-"}|${shown ? tabs.get(shown.id) : ""}|${open ? open.id + (open.view ? "+" : "") : ""}`;
+  const scrollY = viewKey === lastView ? window.scrollY : 0;
+  lastView = viewKey;
   const focusedId = document.activeElement && document.activeElement.dataset
     ? document.activeElement.dataset.key : undefined;
   app.replaceChildren(...content.filter(Boolean));
+  window.scrollTo(0, scrollY);
   app.setAttribute("aria-busy", "false");
   if (focusedId) {
     const again = app.querySelector(`[data-key="${focusedId}"]`);
@@ -352,9 +688,18 @@ function render() {
   announceChanges();
 }
 
+// Escape leaves the open conflict, as Back does, unless a choice is under way.
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  const ws = shownWorkspace();
+  const state = ws && conflictOpen.get(ws.id);
+  if (state && state.busy === null) backToList(ws);
+});
+
 listen("workspaces", (event) => {
   workspaces = event.payload;
   render();
+  for (const [wsId, state] of conflictOpen) refreshNote(wsId, state);
 });
 // Keep "Last synced 2 min ago" and similar times current while visible.
 setInterval(() => { if (!document.hidden && workspaces.length) render(); }, 30000);

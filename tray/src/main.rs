@@ -8,7 +8,10 @@ mod tray;
 use clap::Parser;
 use dispatch_mesh_tray::{
     host::Host,
-    model::{self, Workspace},
+    model::{
+        self, Workspace,
+        conflicts::{Choice, ConflictDetailView, Resolved},
+    },
 };
 use std::{path::PathBuf, sync::Arc};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
@@ -52,6 +55,112 @@ async fn finish_session(state: State<'_, Tray>, id: usize) -> Result<(), String>
         .map_err(|error| error.to_string())?
         .map(|_| ())
         .map_err(|error| format!("{error:#}"))
+}
+
+/// One unresolved conflict for the detail view (US00006). Reads committed
+/// state, so it never waits for the engine; still off the UI thread, since it
+/// runs Git and reads the versions.
+#[tauri::command]
+async fn conflict_detail(
+    state: State<'_, Tray>,
+    id: usize,
+    conflict: String,
+) -> Result<ConflictDetailView, String> {
+    let host = Arc::clone(&state.host);
+    tauri::async_runtime::spawn_blocking(move || host.conflict_detail(id, &conflict))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// The bytes of one side of a conflict, only for an image the window may
+/// preview. They travel raw (an `ArrayBuffer` in the page), keyed by ids; the
+/// page never names a path.
+#[tauri::command]
+async fn conflict_preview(
+    state: State<'_, Tray>,
+    id: usize,
+    conflict: String,
+    side: String,
+) -> Result<tauri::ipc::Response, String> {
+    let host = Arc::clone(&state.host);
+    tauri::async_runtime::spawn_blocking(move || host.conflict_preview(id, &conflict, &side))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("{error:#}"))?
+        .map(|(_, bytes)| tauri::ipc::Response::new(bytes))
+        .ok_or_else(|| "There is no preview for this version.".to_owned())
+}
+
+/// Keep the current version or use the other one, like `dispatch-mesh
+/// conflicts resolve`. Waits for the engine's current operation on a worker
+/// thread. The engine's refusal comes back as the error.
+#[tauri::command]
+async fn resolve_conflict(
+    state: State<'_, Tray>,
+    id: usize,
+    conflict: String,
+    choice: String,
+) -> Result<Resolved, String> {
+    let choice = Choice::parse(&choice).ok_or("Unknown choice.")?;
+    let host = Arc::clone(&state.host);
+    tauri::async_runtime::spawn_blocking(move || host.resolve_conflict(id, &conflict, choice))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// The size the window had before conflict detail widened it, to restore on
+/// Back.
+#[derive(Default)]
+struct Compact(std::sync::Mutex<Option<tauri::PhysicalSize<u32>>>);
+
+/// The detail layout's inner size in logical pixels (US00006, design spec).
+const DETAIL_SIZE: (f64, f64) = (1000.0, 760.0);
+
+/// Widen the window for conflict detail, or restore its compact size. A
+/// maximized window is left alone either way (see [`show_window`]); a widened
+/// one is kept inside the work area like the window at launch.
+#[tauri::command]
+fn set_layout(window: tauri::WebviewWindow, memory: State<Compact>, layout: String) {
+    if window.is_maximized().unwrap_or(true) {
+        return;
+    }
+    let mut remembered = memory.0.lock().unwrap_or_else(|e| e.into_inner());
+    match layout.as_str() {
+        "detail" => {
+            let (Ok(Some(monitor)), Ok(position), Ok(outer), Ok(inner), Ok(scale)) = (
+                window.current_monitor(),
+                window.outer_position(),
+                window.outer_size(),
+                window.inner_size(),
+                window.scale_factor(),
+            ) else {
+                return;
+            };
+            remembered.get_or_insert(inner);
+            let area = monitor.work_area();
+            let fit = model::widen(
+                (inner.width, inner.height),
+                (outer.width - inner.width, outer.height - inner.height),
+                (position.x, position.y),
+                (
+                    (DETAIL_SIZE.0 * scale).round() as u32,
+                    (DETAIL_SIZE.1 * scale).round() as u32,
+                ),
+                (area.position.x, area.position.y),
+                (area.size.width, area.size.height),
+            );
+            let _ = window.set_size(tauri::PhysicalSize::new(fit.inner.0, fit.inner.1));
+            let _ =
+                window.set_position(tauri::PhysicalPosition::new(fit.position.0, fit.position.1));
+        }
+        _ => {
+            if let Some(size) = remembered.take() {
+                let _ = window.set_size(size);
+            }
+        }
+    }
 }
 
 /// Open Explorer with a saved copy selected. The window names the copy by
@@ -175,10 +284,15 @@ fn main() {
             workspaces,
             retry,
             finish_session,
-            show_saved_copy
+            show_saved_copy,
+            conflict_detail,
+            conflict_preview,
+            resolve_conflict,
+            set_layout
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
+            app.manage(Compact::default());
             tray::create(&handle)?;
             let listener = handle.clone();
             let host = Host::new(args.workspaces.clone(), move |workspaces| {

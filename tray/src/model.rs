@@ -12,6 +12,9 @@ use dispatch_mesh::{
 use serde::Serialize;
 use std::path::PathBuf;
 
+pub mod conflicts;
+use conflicts::ConflictList;
+
 /// Windows stores a tray tooltip in 128 UTF-16 units, including the terminator.
 pub const TOOLTIP_LIMIT: usize = 127;
 
@@ -601,20 +604,6 @@ pub struct SavedCopyView {
     pub created_at: u64,
 }
 
-/// The Conflicts tab until conflict review arrives (US00012 Q2).
-pub fn conflicts_placeholder(count: usize) -> String {
-    match count {
-        0 => "No unresolved conflicts.".to_owned(),
-        1 => {
-            "1 unresolved conflict. Review it with the command line until conflict review arrives."
-                .to_owned()
-        }
-        n => format!(
-            "{n} unresolved conflicts. Review them with the command line until conflict review arrives."
-        ),
-    }
-}
-
 /// One workspace as the status window renders it.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct WorkspaceView {
@@ -648,7 +637,9 @@ pub struct WorkspaceView {
     pub conflict_count: usize,
     /// Accessible name of the Conflicts tab.
     pub conflicts_tab: String,
-    pub conflicts_placeholder: String,
+    /// The Conflicts tab: heading, explanation and one entry per conflict
+    /// (US00006); the empty state when there are none.
+    pub conflicts: ConflictList,
     pub sessions: Vec<SessionView>,
     /// Newest first.
     pub saved_copies: Vec<SavedCopyView>,
@@ -712,7 +703,10 @@ pub fn view(workspaces: &[Workspace]) -> Vec<WorkspaceView> {
                 finish_secondary: open_session && action != Some("finish_session"),
                 conflict_count,
                 conflicts_tab: format!("Conflicts, {conflict_count} unresolved"),
-                conflicts_placeholder: conflicts_placeholder(conflict_count),
+                conflicts: conflicts::list(
+                    status.map_or(&[][..], |s| &s.unresolved_conflicts),
+                    status.map_or("", |s| &s.device),
+                ),
                 sessions: status
                     .map(|s| activity(&s.sessions, s.has_remote, &s.device))
                     .unwrap_or_default(),
@@ -763,6 +757,50 @@ pub fn fit_vertically(
     VerticalFit {
         inner_height,
         y: (top != y).then_some(top),
+    }
+}
+
+/// Where a window goes when conflict detail widens it, in physical pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Widened {
+    pub inner: (u32, u32),
+    pub position: (i32, i32),
+}
+
+/// The geometry for the detail layout (US00006): at least `wanted` inner
+/// pixels, never smaller than the window already is, then fitted into the work
+/// area on both axes with the same rule as the launch fit
+/// ([`fit_vertically`] works along either axis). `frame` is the title bar and
+/// border, `(width, height)`.
+pub fn widen(
+    inner: (u32, u32),
+    frame: (u32, u32),
+    position: (i32, i32),
+    wanted: (u32, u32),
+    area_position: (i32, i32),
+    area_size: (u32, u32),
+) -> Widened {
+    let target = (inner.0.max(wanted.0), inner.1.max(wanted.1));
+    let across = fit_vertically(
+        position.0,
+        target.0 + frame.0,
+        frame.0,
+        area_position.0,
+        area_size.0,
+    );
+    let down = fit_vertically(
+        position.1,
+        target.1 + frame.1,
+        frame.1,
+        area_position.1,
+        area_size.1,
+    );
+    Widened {
+        inner: (
+            across.inner_height.unwrap_or(target.0),
+            down.inner_height.unwrap_or(target.1),
+        ),
+        position: (across.y.unwrap_or(position.0), down.y.unwrap_or(position.1)),
     }
 }
 
@@ -1394,11 +1432,7 @@ docs/b.md"
 
         let conflicts = attention("2 unresolved conflicts", true, |s| {
             s.unresolved_conflicts = ["a", "b"]
-                .map(|id| dispatch_mesh::status::ConflictStatus {
-                    id: id.into(),
-                    path: format!("{id}.md"),
-                    binary: false,
-                })
+                .map(|id| conflicts::tests::conflict(id, &format!("{id}.md"), false))
                 .to_vec()
         });
         assert_eq!(conflicts.action, Some("open_conflicts"));
@@ -1554,11 +1588,27 @@ docs/b.md"
             ("text", "offline-card"),
             ("text-2", "offline-card"),
             ("text-3", "offline-card"),
+            // Conflict detail (US00006): the base strip, the later-edit note
+            // and changed lines.
+            ("text", "base-strip"),
+            ("text-2", "base-strip"),
+            ("text-3", "base-strip"),
+            ("text-2", "working-tint"),
+            ("text", "attention-card"),
         ];
         for (theme, tokens) in ["light", "dark"].iter().zip(tokens()) {
             for (fg, bg) in pairs {
                 let ratio = contrast(&tokens[fg], &tokens[bg]);
                 assert!(ratio >= 4.5, "{theme}: {fg} on {bg} is {ratio:.2}:1");
+            }
+            // The other version's dashed border is not text: 3:1 is the bar
+            // for a boundary, on the window and on the cards it frames.
+            for ground in ["ground", "surface"] {
+                let ratio = contrast(&tokens["kept-border"], &tokens[ground]);
+                assert!(
+                    ratio >= 3.0,
+                    "{theme}: kept-border on {ground} is {ratio:.2}:1"
+                );
             }
         }
     }
@@ -1622,21 +1672,71 @@ docs/b.md"
     }
 
     #[test]
-    fn the_conflicts_tab_shows_a_placeholder_until_conflict_review() {
-        assert_eq!(conflicts_placeholder(0), "No unresolved conflicts.");
-        assert_eq!(
-            conflicts_placeholder(1),
-            "1 unresolved conflict. Review it with the command line until conflict review arrives."
-        );
-        assert_eq!(
-            conflicts_placeholder(3),
-            "3 unresolved conflicts. Review them with the command line until conflict review arrives."
-        );
+    fn the_conflicts_tab_lists_the_conflicts_or_says_there_are_none() {
         let none = view(&[running(0, "A", Summary::Synced, None)]).remove(0);
         assert_eq!(
             (none.conflict_count, none.conflicts_tab.as_str()),
             (0, "Conflicts, 0 unresolved")
         );
+        assert_eq!(none.conflicts.heading, "No unresolved conflicts.");
+        assert!(none.conflicts.entries.is_empty());
+
+        let one = attention("1 unresolved conflict", true, |s| {
+            s.unresolved_conflicts = vec![conflicts::tests::conflict("a", "a.md", false)];
+        });
+        assert_eq!(one.conflicts.heading, "1 unresolved conflict");
+        assert_eq!(one.conflicts.entries.len(), 1);
+        assert!(
+            !serde_json::to_string(&one)
+                .unwrap()
+                .contains("until conflict review arrives"),
+            "the placeholder is gone"
+        );
+    }
+
+    #[test]
+    fn the_detail_layout_widens_to_the_wanted_size_and_stays_inside_the_work_area() {
+        // A 440 × 640 window (inner) with 16 × 39 px of frame at (100, 50) on a
+        // 1920 × 1040 work area starting at (0, 0).
+        let area = ((0, 0), (1920, 1040));
+        let wide = widen((440, 640), (16, 39), (100, 50), (1000, 760), area.0, area.1);
+        assert_eq!(wide.inner, (1000, 760));
+        assert_eq!(wide.position, (100, 50), "fits where it is");
+        // Near the right edge it moves left instead of running off screen.
+        let moved = widen(
+            (440, 640),
+            (16, 39),
+            (1700, 50),
+            (1000, 760),
+            area.0,
+            area.1,
+        );
+        assert_eq!(moved.inner, (1000, 760));
+        assert_eq!(moved.position.0, 1920 - (1000 + 16));
+        // A screen smaller than the detail layout shortens and narrows it.
+        let small = widen(
+            (440, 640),
+            (16, 39),
+            (0, 0),
+            (1000, 760),
+            (0, 0),
+            (900, 600),
+        );
+        assert_eq!(small.inner, (900 - 16, 600 - 39));
+        assert_eq!(small.position, (0, 0));
+        // A window the user already made larger is never shrunk.
+        let big = widen((1300, 900), (16, 39), (0, 0), (1000, 760), area.0, area.1);
+        assert_eq!(big.inner, (1300, 900));
+        // A second monitor left of the primary has a negative origin.
+        let left = widen(
+            (440, 640),
+            (16, 39),
+            (-1900, 50),
+            (1000, 760),
+            (-1920, 0),
+            (1920, 1040),
+        );
+        assert_eq!(left.position, (-1900, 50));
     }
 
     #[test]

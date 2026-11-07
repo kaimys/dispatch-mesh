@@ -371,3 +371,427 @@ fn saved_copies_resolve_only_from_ids_the_status_lists() {
     );
     host.quit();
 }
+
+// ---- Conflict review (US00006) ----------------------------------------
+
+mod conflicts {
+    use super::*;
+    use dispatch_mesh::{git::Git, model::now};
+    use dispatch_mesh_tray::model::conflicts::{Body, Choice};
+
+    const BASE: &str = "one\ntwo\nthree\n";
+    const PNG: [u8; 12] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0];
+
+    fn person(name: &str) -> Identity {
+        Identity {
+            name: name.into(),
+            email: format!("{}@example.test", name.to_lowercase()),
+        }
+    }
+
+    fn client(parent: &Path, name: &str, origin: &Path) -> Engine {
+        std::fs::create_dir_all(parent.join(name)).unwrap();
+        Engine::init(
+            &parent.join(name),
+            person(name),
+            Some(origin.to_string_lossy().into_owned()),
+            "main".into(),
+        )
+        .unwrap()
+    }
+
+    /// Publish the closed session, as the runner would over later cycles.
+    fn finish(workspace: &mut Engine) {
+        let id = workspace.finish().unwrap();
+        workspace.sync().unwrap();
+        if let Some(id) = id
+            && let Some(input) = workspace.summary_input(&id).unwrap()
+        {
+            let session = workspace.state.manifest.sessions.get_mut(&id).unwrap();
+            session.message = Some(dispatch_mesh::ai::fallback(&input));
+            session.message_base = input.message_base;
+            workspace.save().unwrap();
+        }
+        workspace.sync().unwrap();
+    }
+
+    fn origin(parent: &Path) -> PathBuf {
+        let origin = parent.join("remote.git");
+        Git {
+            dir: origin.clone(),
+        }
+        .init()
+        .unwrap();
+        origin
+    }
+
+    /// Alice and Bob start from `files`, then each changes some of them
+    /// (`None` deletes). Bob saves first, so his versions are the current
+    /// ones. Returns Bob's folder, with the conflicts recorded and no engine
+    /// running.
+    fn collide(
+        parent: &Path,
+        files: &[(&str, &[u8])],
+        alice_edits: &[(&str, Option<&[u8]>)],
+        bob_edits: &[(&str, Option<&[u8]>)],
+    ) -> PathBuf {
+        let origin = origin(parent);
+        let mut alice = client(parent, "Alice", &origin);
+        for (path, bytes) in files {
+            std::fs::write(alice.root.join(path), bytes).unwrap();
+        }
+        finish(&mut alice);
+        let mut bob = client(parent, "Bob", &origin);
+        bob.sync().unwrap();
+        let edit = |engine: &mut Engine, edits: &[(&str, Option<&[u8]>)], at: u64| {
+            for (path, bytes) in edits {
+                match bytes {
+                    Some(bytes) => std::fs::write(engine.root.join(path), bytes).unwrap(),
+                    None => std::fs::remove_file(engine.root.join(path)).unwrap(),
+                }
+            }
+            engine.capture_at(at).unwrap();
+        };
+        let at = now();
+        edit(&mut bob, bob_edits, at);
+        edit(&mut alice, alice_edits, at + 5);
+        alice.sync().unwrap();
+        bob.sync().unwrap();
+        assert!(bob.unresolved().count() > 0, "Bob holds the conflicts");
+        bob.root.clone()
+    }
+
+    fn text_conflict(parent: &Path) -> PathBuf {
+        collide(
+            parent,
+            &[("note.md", BASE.as_bytes())],
+            &[("note.md", Some(b"ALICE\ntwo\nthree\n"))],
+            &[("note.md", Some(b"BOB\ntwo\nthree\n"))],
+        )
+    }
+
+    /// Wait until the host reports `count` unresolved conflicts for workspace 0.
+    fn listed(host: &Host, count: usize) -> dispatch_mesh::status::Status {
+        let workspaces = wait_until(host, "the conflicts are listed", |w| {
+            status(&w[0]).is_some_and(|s| s.unresolved_conflicts.len() == count)
+        });
+        status(&workspaces[0]).unwrap().clone()
+    }
+
+    fn id_of(status: &dispatch_mesh::status::Status, path: &str) -> String {
+        status
+            .unresolved_conflicts
+            .iter()
+            .find(|c| c.path == path)
+            .unwrap_or_else(|| panic!("{path}: {:?}", status.unresolved_conflicts))
+            .id
+            .clone()
+    }
+
+    fn resolutions(root: &Path) -> Vec<Option<Vec<u8>>> {
+        let engine = Engine::inspect(root).unwrap();
+        engine
+            .state
+            .manifest
+            .resolutions
+            .values()
+            .map(|r| r.selected.clone())
+            .collect()
+    }
+
+    #[test]
+    fn resolving_from_the_host_does_what_the_engine_call_does_while_the_runner_runs() {
+        for choice in [Choice::Current, Choice::Other] {
+            let parent = tempfile::tempdir().unwrap();
+            let via_host = text_conflict(&parent.path().join("host"));
+            let direct = text_conflict(&parent.path().join("direct"));
+            {
+                let mut engine = Engine::open(&direct).unwrap();
+                let id = engine.unresolved().next().unwrap().id.clone();
+                engine.resolve(&id, choice.incoming()).unwrap();
+            }
+
+            let (host, _) = host(std::slice::from_ref(&via_host));
+            host.start_all();
+            let status = listed(&host, 1);
+            let id = id_of(&status, "note.md");
+            let resolved = host.resolve_conflict(0, &id, choice).unwrap();
+            assert!(resolved.confirmation.starts_with(match choice {
+                Choice::Current => "note.md: kept the current version.",
+                Choice::Other => "note.md: used the other version.",
+            }));
+            assert_eq!(resolved.next, None, "no other conflict is left");
+            listed(&host, 0);
+            host.quit();
+
+            let expected = match choice {
+                Choice::Current => "BOB\ntwo\nthree\n",
+                Choice::Other => "ALICE\ntwo\nthree\n",
+            };
+            assert_eq!(
+                std::fs::read_to_string(via_host.join("note.md")).unwrap(),
+                expected
+            );
+            assert_eq!(
+                std::fs::read(via_host.join("note.md")).unwrap(),
+                std::fs::read(direct.join("note.md")).unwrap()
+            );
+            assert_eq!(resolutions(&via_host), resolutions(&direct));
+            assert_eq!(resolutions(&via_host), [Some(expected.as_bytes().to_vec())]);
+        }
+    }
+
+    #[test]
+    fn resolving_names_the_next_conflict_in_list_order() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = collide(
+            parent.path(),
+            &[("a.md", BASE.as_bytes()), ("b.md", BASE.as_bytes())],
+            &[
+                ("a.md", Some(b"ALICE\ntwo\nthree\n")),
+                ("b.md", Some(b"ALICE\ntwo\nthree\n")),
+            ],
+            &[
+                ("a.md", Some(b"BOB\ntwo\nthree\n")),
+                ("b.md", Some(b"BOB\ntwo\nthree\n")),
+            ],
+        );
+        let (host, _) = host(std::slice::from_ref(&root));
+        host.start_all();
+        let status = listed(&host, 2);
+        let ordered = dispatch_mesh_tray::model::conflicts::ordered(&status.unresolved_conflicts);
+        let (first, second) = (ordered[0].id.clone(), ordered[1].id.clone());
+        let detail = host.conflict_detail(0, &first).unwrap();
+        assert_eq!(detail.position, "1 of 2");
+        let resolved = host.resolve_conflict(0, &first, Choice::Current).unwrap();
+        assert_eq!(resolved.next.as_deref(), Some(second.as_str()));
+        listed(&host, 1);
+        assert_eq!(host.conflict_detail(0, &second).unwrap().position, "1 of 1");
+        host.quit();
+    }
+
+    #[test]
+    fn a_later_save_is_noted_and_the_engine_refuses_the_choice_without_recording_it() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = text_conflict(parent.path());
+        let (host, _) = host(std::slice::from_ref(&root));
+        host.start_all();
+        let id = id_of(&listed(&host, 1), "note.md");
+        assert!(host.conflict_detail(0, &id).unwrap().note.is_none());
+
+        std::fs::write(root.join("note.md"), "BOB again\ntwo\nthree\n").unwrap();
+        let started = Instant::now();
+        let view = loop {
+            let view = host.conflict_detail(0, &id).unwrap();
+            if view.note.is_some() {
+                break view;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "the save was not captured"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(!view.can_choose);
+        let error = host.resolve_conflict(0, &id, Choice::Other).unwrap_err();
+        assert!(format!("{error:#}").contains("newer edits"), "{error:#}");
+        host.quit();
+        assert!(resolutions(&root).is_empty(), "nothing was recorded");
+        assert_eq!(
+            std::fs::read_to_string(root.join("note.md")).unwrap(),
+            "BOB again\ntwo\nthree\n",
+            "the later edit is untouched"
+        );
+    }
+
+    #[test]
+    fn review_is_refused_where_the_engine_does_not_run_here_or_the_conflict_is_unknown() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = text_conflict(parent.path());
+        let id = Engine::inspect(&root)
+            .unwrap()
+            .unresolved()
+            .next()
+            .unwrap()
+            .id
+            .clone();
+        {
+            let lease = runner::acquire(&root).unwrap();
+            let (host, _) = host(std::slice::from_ref(&root));
+            host.start_all();
+            wait_until(&host, "refused", |w| {
+                w[0].state == WorkspaceState::AlreadyRunning
+            });
+            assert!(host.conflict_detail(0, &id).is_err());
+            assert!(host.conflict_preview(0, &id, "current").is_err());
+            assert!(host.resolve_conflict(0, &id, Choice::Current).is_err());
+            host.quit();
+            drop(lease);
+        }
+
+        let (host, _) = host(std::slice::from_ref(&root));
+        host.start_all();
+        listed(&host, 1);
+        assert!(host.conflict_detail(0, "no-such-conflict").is_err());
+        assert!(
+            host.conflict_preview(0, "no-such-conflict", "current")
+                .is_err()
+        );
+        assert!(
+            host.resolve_conflict(0, "no-such-conflict", Choice::Current)
+                .is_err()
+        );
+        assert!(host.conflict_detail(9, &id).is_err(), "unknown workspace");
+        assert!(
+            host.conflict_preview(0, &id, "../../note.md").is_err(),
+            "unknown side"
+        );
+        host.quit();
+        assert!(resolutions(&root).is_empty());
+    }
+
+    #[test]
+    fn each_kind_of_conflict_gets_its_own_detail_view() {
+        let parent = tempfile::tempdir().unwrap();
+        let large_current = vec![b'a'; 1024 * 1024 + 1];
+        let large_other = vec![b'b'; 1024 * 1024 + 1];
+        let mut png_alice = PNG.to_vec();
+        png_alice.push(1);
+        let mut png_bob = PNG.to_vec();
+        png_bob.push(2);
+        let root = collide(
+            parent.path(),
+            &[
+                ("note.md", BASE.as_bytes()),
+                ("gone.md", BASE.as_bytes()),
+                ("big.md", b"base\n"),
+                ("logo.png", &PNG),
+            ],
+            &[
+                ("note.md", Some(b"ALICE\ntwo\nthree\n")),
+                ("gone.md", None),
+                ("big.md", Some(&large_other)),
+                ("logo.png", Some(&png_alice)),
+            ],
+            &[
+                ("note.md", Some(b"BOB\ntwo\nthree\n")),
+                ("gone.md", Some(b"BOB\ntwo\nthree\n")),
+                ("big.md", Some(&large_current)),
+                ("logo.png", Some(&png_bob)),
+            ],
+        );
+        let (host, _) = host(std::slice::from_ref(&root));
+        host.start_all();
+        let status = listed(&host, 4);
+        let view = |path: &str| host.conflict_detail(0, &id_of(&status, path)).unwrap();
+
+        let text = view("note.md");
+        assert!(matches!(text.body, Body::Text { .. }));
+        assert_eq!(text.keep_label, "Keep current version (You)");
+        assert_eq!(text.use_label, "Use other version (Alice)");
+        assert!(text.base.is_some());
+
+        let deleted = view("gone.md");
+        assert!(deleted.other.placeholder.is_some());
+        assert_eq!(deleted.use_label, "Use other version (deleted by Alice)");
+
+        let big = view("big.md");
+        assert_eq!(
+            big.body,
+            Body::Metadata {
+                reason: "Too large to compare here"
+            }
+        );
+        assert!(big.can_choose, "both choices remain");
+
+        let image = view("logo.png");
+        assert_eq!(image.body, Body::Binary);
+        assert_eq!(
+            image.current.preview.as_ref().map(|p| p.mime),
+            Some("image/png")
+        );
+        assert!(!image.summary.contains("saved copy"));
+
+        // Previews come back for images only, as bytes by id and side.
+        let logo = id_of(&status, "logo.png");
+        let (mime, bytes) = host.conflict_preview(0, &logo, "current").unwrap().unwrap();
+        assert_eq!((mime, bytes), ("image/png", png_bob));
+        let (_, other) = host.conflict_preview(0, &logo, "other").unwrap().unwrap();
+        assert_eq!(other, png_alice);
+        assert_eq!(
+            host.conflict_preview(0, &id_of(&status, "note.md"), "current")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            host.conflict_preview(0, &id_of(&status, "gone.md"), "other")
+                .unwrap(),
+            None
+        );
+        host.quit();
+    }
+
+    #[test]
+    fn a_non_utf8_file_gets_the_binary_view_with_whole_file_choice() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = collide(
+            parent.path(),
+            &[("legacy.txt", b"base\n")],
+            &[("legacy.txt", Some(&[b'a', 0xE9, b'\n']))],
+            &[("legacy.txt", Some(&[b'b', 0xE9, b'\n']))],
+        );
+        let (host, _) = host(std::slice::from_ref(&root));
+        host.start_all();
+        let status = listed(&host, 1);
+        assert!(status.unresolved_conflicts[0].binary);
+        let view = host
+            .conflict_detail(0, &id_of(&status, "legacy.txt"))
+            .unwrap();
+        assert_eq!(view.body, Body::Binary);
+        assert!(view.current.preview.is_none());
+        assert_eq!(
+            view.footer,
+            "Whole-file choice only. Both versions stay in history."
+        );
+        host.quit();
+    }
+
+    #[test]
+    fn a_current_version_from_shared_history_is_named_by_the_commit_that_made_it() {
+        let parent = tempfile::tempdir().unwrap();
+        let origin = origin(parent.path());
+        let mut alice = client(parent.path(), "Alice", &origin);
+        std::fs::write(alice.root.join("note.md"), BASE).unwrap();
+        finish(&mut alice);
+        let mut bob = client(parent.path(), "Bob", &origin);
+        let mut carol = client(parent.path(), "Carol", &origin);
+        bob.sync().unwrap();
+        carol.sync().unwrap();
+        std::fs::write(alice.root.join("note.md"), "ALICE\ntwo\nthree\n").unwrap();
+        finish(&mut alice);
+        std::fs::write(carol.root.join("note.md"), "CAROL\ntwo\nthree\n").unwrap();
+        carol.capture_at(now()).unwrap();
+        bob.sync().unwrap();
+        carol.sync().unwrap();
+        bob.sync().unwrap();
+        let root = bob.root.clone();
+        drop((alice, bob, carol));
+
+        let (host, _) = host(std::slice::from_ref(&root));
+        host.start_all();
+        let status = listed(&host, 1);
+        assert!(status.unresolved_conflicts[0].current.shared_history);
+        let view = host.conflict_detail(0, &id_of(&status, "note.md")).unwrap();
+        assert_eq!(view.keep_label, "Keep current version (shared history)");
+        assert!(
+            view.current
+                .byline
+                .text
+                .starts_with("Alice · shared history · saved"),
+            "{:?}",
+            view.current.byline
+        );
+        assert_eq!(view.use_label, "Use other version (Carol)");
+        host.quit();
+    }
+}

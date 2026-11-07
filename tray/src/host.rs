@@ -4,11 +4,15 @@
 //! Free of Tauri types: the window and tray subscribe through a listener, so
 //! starting, refusing, retrying and quitting are tested with real workspaces.
 
-use crate::model::{Workspace, WorkspaceState};
+use crate::model::{
+    Workspace, WorkspaceState,
+    conflicts::{self, Choice, ConflictDetailView, Resolved},
+};
 use anyhow::{Context, Result, bail};
 use dispatch_mesh::{
     engine::{Workspace as Engine, WorkspaceBusy},
     runner::{AlreadyRunning, Runner, RunnerHandle, StatusReceiver},
+    status::{LocalObservation, Status},
 };
 use std::{
     path::{Path, PathBuf},
@@ -68,6 +72,25 @@ fn resolve(path: PathBuf) -> PathBuf {
     dunce::canonicalize(&path)
         .or_else(|_| std::path::absolute(&path))
         .unwrap_or(path)
+}
+
+/// Open the workspace for a write, waiting up to 30 s for the runner's
+/// current operation: the engine fails fast with `WorkspaceBusy` after 500 ms,
+/// and the CLI keeps doing so on purpose. Blocks, so call it off the UI thread.
+fn open_engine(path: &Path) -> Result<Engine> {
+    let started = std::time::Instant::now();
+    loop {
+        match Engine::open(path) {
+            Ok(workspace) => return Ok(workspace),
+            Err(error)
+                if error.is::<WorkspaceBusy>()
+                    && started.elapsed() < std::time::Duration::from_secs(30) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50))
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 impl Host {
@@ -273,20 +296,101 @@ impl Host {
             }
             entry.workspace.path.clone()
         };
-        let started = std::time::Instant::now();
-        let mut workspace = loop {
-            match Engine::open(&path) {
-                Ok(workspace) => break workspace,
-                Err(error)
-                    if error.is::<WorkspaceBusy>()
-                        && started.elapsed() < std::time::Duration::from_secs(30) =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(50))
-                }
-                Err(error) => return Err(error),
+        open_engine(&path)?.finish()
+    }
+
+    /// The workspace's latest snapshot, for a workspace the engine runs here.
+    /// Conflict review is refused elsewhere, as Finish session is, because
+    /// then this host does not look after the workspace.
+    fn running_status(&self, id: usize) -> Result<(PathBuf, Status)> {
+        let entries = self.entries.lock().unwrap();
+        let entry = entries.get(id).context("No such workspace")?;
+        if entry.handle.is_none() {
+            bail!("Mesh is not running this workspace here");
+        }
+        match &entry.workspace.state {
+            WorkspaceState::Running(Some(snapshot)) => {
+                Ok((entry.workspace.path.clone(), snapshot.status.clone()))
             }
+            _ => bail!("Mesh is not running this workspace here"),
+        }
+    }
+
+    /// [`running_status`](Self::running_status), refused too for a conflict
+    /// the snapshot does not list: the window sends ids only.
+    fn listed_conflict(&self, id: usize, conflict: &str) -> Result<(PathBuf, Status)> {
+        let (path, status) = self.running_status(id)?;
+        if !status.unresolved_conflicts.iter().any(|c| c.id == conflict) {
+            bail!("This conflict is no longer unresolved");
+        }
+        Ok((path, status))
+    }
+
+    /// One unresolved conflict as the detail view shows it. Reads committed
+    /// state without waiting for the engine's current operation.
+    pub fn conflict_detail(&self, id: usize, conflict: &str) -> Result<ConflictDetailView> {
+        let (path, _) = self.listed_conflict(id, conflict)?;
+        let engine = Engine::inspect(&path)?;
+        let detail = engine.conflict_detail(conflict)?;
+        // "n of N" follows committed state, not the latest snapshot, which
+        // can still list a conflict that was settled a moment ago.
+        let status = engine.status_from(LocalObservation::default());
+        let list = conflicts::ordered(&status.unresolved_conflicts);
+        let at = list
+            .iter()
+            .position(|c| c.id == conflict)
+            .unwrap_or_default();
+        Ok(conflicts::detail_view(
+            &detail,
+            &status.device,
+            (at + 1, list.len()),
+        ))
+    }
+
+    /// The bytes of one side (`current`, `other` or `base`) with their image
+    /// type, only for an image the window may preview (PNG, JPEG, GIF or WebP
+    /// up to 10 MB). `None` for anything else; the window never gets a path.
+    pub fn conflict_preview(
+        &self,
+        id: usize,
+        conflict: &str,
+        side: &str,
+    ) -> Result<Option<(&'static str, Vec<u8>)>> {
+        let (path, _) = self.listed_conflict(id, conflict)?;
+        let detail = Engine::inspect(&path)?.conflict_detail(conflict)?;
+        let bytes = match side {
+            "current" => detail.current,
+            "other" => detail.other,
+            "base" => detail.base,
+            _ => bail!("Unknown side of a conflict"),
         };
-        workspace.finish()
+        Ok(bytes
+            .and_then(|bytes| conflicts::previewable(&bytes).map(|image| (image.mime(), bytes))))
+    }
+
+    /// Settle a conflict like `dispatch-mesh conflicts resolve` does next to
+    /// a running engine: the same engine call, so the same record and folder
+    /// content. Waits for the engine's current operation, so call it off the
+    /// UI thread. The engine's refusal (for example a newer edit) comes back
+    /// as the error, with nothing recorded.
+    pub fn resolve_conflict(&self, id: usize, conflict: &str, choice: Choice) -> Result<Resolved> {
+        let (path, _) = self.listed_conflict(id, conflict)?;
+        let mut engine = open_engine(&path)?;
+        // The list the window shows is ordered the same way, and the engine's
+        // own state is current where the latest snapshot may not be.
+        let before = engine.status_from(LocalObservation::default());
+        let list = conflicts::ordered(&before.unresolved_conflicts);
+        let name = list
+            .iter()
+            .find(|c| c.id == conflict)
+            .map(|c| c.path.clone())
+            .context("This conflict is no longer unresolved")?;
+        let ids: Vec<&str> = list.iter().map(|c| c.id.as_str()).collect();
+        engine.resolve(conflict, choice.incoming())?;
+        Ok(Resolved {
+            confirmation: conflicts::confirmation(&name, choice),
+            next: conflicts::next_after(conflict, &ids),
+        })
     }
 
     /// Where a saved copy listed in the workspace's latest status is kept, or
