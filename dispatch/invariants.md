@@ -43,6 +43,7 @@ An empty counter means *nobody has counted*, and it renders no badge. `0` means 
 
 - **One code review per story.** It ends when `open_findings` reaches `0`. Fixing blocking findings belongs to that review: the fix round clears `open_findings` to empty, and the re-check of those fixes writes the `0`. Once `open_findings` is `0`, it stays `0`; later code changes, including fixes for non-blocking findings or for failed tests, do not reset it or call for another review.
 - **One test plan per story.** `/test-plan` runs once; it writes the plan, sets `open_tests` and stamps the freeze. When a check fails, fix the cause, record the failure and the fix as dated entries (test-plan results and as-built notes), run the check again on the fixed build, and tick it once it passes. The fix resets no counter, no status changes, and the ticket stays in `Review`; a second test plan is not written.
+- **No screen-reader tests.** Manual test plans contain no Narrator or other screen-reader checks (Kai, 2026-11-07). Accessible names, screen-reader-only text and keyboard order are still built and reviewed; they are not part of the manual pass.
 
 ## Direct status writes
 
