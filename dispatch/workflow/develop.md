@@ -13,7 +13,7 @@ Runs development for one ticket. `<ARGS>` is the ticket id.
 ## Start
 
 1. Resolve the ticket (spec via `id: <ARGS>` in `dispatch/wiki/05_Requirements/Tickets`, task in none) and name the session `<ARGS> <short name>`.
-2. **Pull the default branch first**, then branch off the freshly pulled tip. A stale base forces an avoidable merge later, and on a shared repo it happens within a day.
+2. **Pull the default branch first**, then branch off the freshly pulled tip. A stale base forces an avoidable merge later, and on a shared repo it happens within a day. The one exception is an `/orchestrate` run, which cuts the branch from the previous ticket's branch on purpose; then skip this step and record the base in the as-built entry.
 3. **Preconditions** — expected status is `Refinement` or the human-approved `Refinement` queue, acceptance criteria are final, `open_questions: 0`, and for anything non-trivial an approved `## Implementation plan` exists. If something is missing, say so and suggest `/refine` or `/implementation-plan`. **Do not code around a missing decision** — that is how a guess becomes a shipped behaviour nobody chose.
 4. The explicit development invocation authorizes the move after those checks. Move to `In progress` in both systems, set `assignee:` to whoever is doing the work, and strip leftover `<!-- GUIDE: … -->` from sections you finalise.
 
