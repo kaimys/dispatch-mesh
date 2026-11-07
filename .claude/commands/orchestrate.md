@@ -1,5 +1,5 @@
 ---
-description: Steer development, code review and test plan across several tickets with subagents until a stated goal is reached — ticket branches stacked, review loop capped at three rounds, humans review the result together.
+description: Plan a multi-ticket run, have the human confirm it, then steer development, code review and test plan with subagents until the goal is reached — ticket branches stacked, review rounds bounded, humans review the result together.
 argument-hint: <goal>
 ---
 # /orchestrate $ARGUMENTS

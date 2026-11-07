@@ -17,11 +17,14 @@ The orchestrator's prompt names:
 - **Task** — one of `develop`, `fix-findings` or `test-plan`.
 - **Worktree** — the absolute path of the run worktree. Run every command there; never touch another checkout.
 - **Branch** and **Base** — the ticket branch, already created and checked out, and the branch it was cut from. The base is the previous ticket of the run (or the default branch for the first ticket), so this branch carries that ticket's commits too. Your work is only `<Base>..HEAD`.
+- **Human ruling** (optional) — an answer or decision the human gave, with their words and the date. Record it in the ticket as a dated as-built entry before you act on it, and follow it.
+
+When you hit a question only the human can answer (a missing decision, a plan that contradicts the code in a way that changes behaviour), do not guess: record the question in the ticket and report `blocked` with it. The orchestrator asks the human and launches a new agent with the answer.
 
 ## Tasks
 
 - `develop` — follow `dispatch/workflow/develop.md` with `<ARGS>` = the ticket id, with one override: **skip step 2.** The orchestrator already cut the branch from the base on purpose, so the tickets of this run stack and do not conflict. Do not pull, rebase or switch branches. Record the base in the as-built entry (`branch <Branch>, stacked on <Base>`).
-- `fix-findings` — read the newest entry under `## Code review` in the ticket and fix its blocking findings (fix the non-blocking ones the entry says belong before merge, too, when they are cheap and local). This is a `/develop` session: follow steps 5–11 of `dispatch/workflow/develop.md`, including step 11 — clear `open_findings` to empty, never to `0`. Add a dated as-built entry listing each finding number and how it was fixed. If a finding turns on a product decision, do not guess: say so in the ticket and in your report.
+- `fix-findings` — read the newest entry under `## Code review` in the ticket and fix its **blocking findings, and nothing else**. Non-blocking findings stay as follow-ups; refactoring or polishing beyond the fix hands the next review new surface and costs a round. This is a `/develop` session: follow steps 5–11 of `dispatch/workflow/develop.md`, including step 11 — clear `open_findings` to empty, never to `0`. Add a dated as-built entry listing each finding number and how it was fixed. If a finding turns on a product decision, or you disagree that it is a defect, do not guess and do not argue it in code: report `blocked` with the question, so the orchestrator can ask the human.
 - `test-plan` — follow `dispatch/workflow/test-plan.md` with `<ARGS>` = the ticket id. Its precondition `open_findings: 0` must hold; if it does not, stop and report.
 
 ## Rules
@@ -45,4 +48,5 @@ gates: <green | red | not run>
 open_findings: <value in the ticket now, or empty>
 open_tests: <value in the ticket now, or empty>
 note: <one line: what was done, or why it is blocked>
+question: <the question for the human, or none>
 ```
