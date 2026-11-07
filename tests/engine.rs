@@ -92,6 +92,33 @@ fn published_history_is_immutable_and_binary_bytes_round_trip() {
 }
 
 #[test]
+fn status_names_the_device_of_own_and_received_sessions() {
+    // US00012 Q5: hosts tell this device's sessions from received ones.
+    let temp = TempDir::new().unwrap();
+    let origin = temp.path().join("remote.git");
+    remote(&origin);
+    let mut alice = init(&temp.path().join("alice"), "Alice", Some(&origin));
+    let mut bob = init(&temp.path().join("bob"), "Bob", Some(&origin));
+    fs::write(alice.root.join("note.md"), "from alice").unwrap();
+    alice.sync().unwrap();
+    bob.sync().unwrap();
+    fs::write(bob.root.join("other.md"), "from bob").unwrap();
+    bob.capture_at(now()).unwrap();
+    let status = bob.status_snapshot();
+    let device_of = |file: &str| {
+        status
+            .sessions
+            .iter()
+            .find(|s| s.files.iter().any(|f| f == file))
+            .map(|s| s.device.clone())
+            .unwrap()
+    };
+    assert_eq!(device_of("other.md"), status.device);
+    assert_eq!(device_of("note.md"), alice.config.device);
+    assert_ne!(device_of("note.md"), status.device);
+}
+
+#[test]
 fn draft_reaches_another_client_before_session_closes() {
     let temp = TempDir::new().unwrap();
     let origin = temp.path().join("remote.git");

@@ -609,6 +609,10 @@ fn status_json_adds_session_detail_without_changing_existing_fields() {
     }
     assert_eq!(session["stage"], "waiting_for_finalization");
     assert_eq!(session["author"]["name"], "Alice");
+    assert_eq!(
+        session["device"], open["device"],
+        "an own session (US00012)"
+    );
     assert_eq!(session["purposes"], serde_json::json!(["Explain setup"]));
     assert!(session["title"].is_null(), "not published yet: {session:#}");
     let started = session["started_at"].as_u64().unwrap();

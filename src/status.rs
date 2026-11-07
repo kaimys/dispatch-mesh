@@ -38,6 +38,9 @@ pub enum Stage {
 pub struct SessionStatus {
     pub id: String,
     pub author: Identity,
+    /// The device the session was made on; compare with [`Status::device`]
+    /// to tell this device's sessions from received ones (US00012).
+    pub device: String,
     pub stage: Stage,
     pub closed: bool,
     pub published: bool,
@@ -247,6 +250,7 @@ impl Workspace {
                     purposes: purposes(s),
                     id: s.id.clone(),
                     author: s.author.clone(),
+                    device: s.device.clone(),
                     stage: self.session_stage(s),
                     closed: s.closed,
                     published: s.published,
