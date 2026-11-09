@@ -4,3 +4,5 @@
 /.mesh/
 *.tmp
 /tray/gen/
+/.codex/config.toml
+/.codex/cache/
