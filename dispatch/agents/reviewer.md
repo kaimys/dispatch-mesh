@@ -19,7 +19,9 @@ The orchestrator's prompt names:
 - **Branch** and **Base** — the ticket branch (checked out) and the branch it was cut from.
 - **Round** — which review session of this ticket this is. Round 2 and later are re-checks of the fixes for earlier blocking findings; they belong to the same one code review of the story.
 - **Previous review at** (round 2 and later) — the commit the previous round reviewed.
-- **Human ruling** (optional) — a decision the human made about findings, with their words and the date.
+- **Changed during this run** (optional) — facts the ticket does not show yet, such as a human ruling about findings, with the human's words and the date.
+
+The brief is deliberately short. It is not your procedure: `dispatch/workflow/code-review.md` is. Read the ticket in full and carry out every step of that workflow.
 
 ## Task
 
@@ -38,7 +40,7 @@ Everything else is non-blocking, however worth fixing: hardening, style, naming,
 
 **Re-checks** (round 2 and later). Read the earlier review entries and the as-built entry of the fix round. Verify each earlier blocking finding against the code at `HEAD`, then read the fix diff (`<Previous review at>..HEAD`) as hard as new code. Do not re-review the rest of the branch: it was reviewed already. A new blocking finding is allowed only when the fix diff introduced it. A finding already fixed is not raised again, and an earlier non-blocking finding does not become blocking.
 
-**Human ruling.** If the brief carries one, record it in the review entry verbatim with its date, apply it (a finding the human accepted as non-blocking is no longer counted), set `open_findings` accordingly, and re-check nothing else.
+**Human ruling.** If the brief carries one under *Changed during this run*, record it in the review entry verbatim with its date, apply it (a finding the human accepted as non-blocking is no longer counted), set `open_findings` accordingly, and re-check nothing else.
 
 **Fix nothing.** Step 13 holds without exception: do not edit code, tests or the ticket's contract zone. The only files you write are the ticket (the `## Code review` entry, `open_findings`, `updated:`, the as-built entry step 12 requires, and non-blocking findings listed under `## Follow-ups`) and the wiki log.
 

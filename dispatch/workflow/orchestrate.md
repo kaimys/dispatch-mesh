@@ -30,6 +30,16 @@ The steps below are tool-neutral. Where they need a tool-specific mechanism:
 
 Subagents inherit the session's permissions. A run with frequent approval prompts stalls; say in the plan which permission mode the run needs.
 
+## Briefs
+
+A brief is short, like a human's `/develop US00006`. The ticket and the workflow file carry the context and the procedure; a long brief competes with them, and an agent that reads a detailed brief tends to treat it as the procedure and skip workflow steps it does not repeat. A brief holds only:
+
+- **Ticket**, **Task** (developer) or **Round** (reviewer);
+- **Worktree**, **Branch**, **Base** — and, from round 2, **Previous review at**;
+- **Changed during this run**, only when something did: the tickets below this one in the stack and the files they touched where this ticket's plan touches the same code, a human ruling (with the human's words and date), or a state the ticket does not show yet. One line each, facts only.
+
+Never restate the ticket, its plan, the workflow steps, or the agent's own rules in a brief.
+
 ## Bounds
 
 The run cannot loop. Per ticket it launches at most **1 development + `max_reviews` reviews + (`max_reviews` − 1) fix rounds + 1 test plan** agents; with the default `max_reviews: 3` that is 7. Only the human can add to it, at most one extra fix round and re-check per ticket, or one reviewer launch to record a ruling (see *Asking the human*). Inside that budget the loop also stops early:
@@ -67,7 +77,7 @@ In `attended` mode the orchestrator stops and asks — naming the ticket and the
 - the review loop stops with blocking findings left (cap reached or no progress). Options: *one more fix round and re-check* (at most once per ticket), *accept named findings as non-blocking* (a human ruling), *leave the ticket blocked and continue*, *stop the run*;
 - the repository or a ticket is in a state the plan did not foresee (diverged base, unexpected commits, a ticket changed by someone else meanwhile).
 
-The answer is passed in the next agent's brief as **Human ruling** with the human's words and the date; that agent records it in the ticket (developer: as-built entry; reviewer: the review entry). A ruling that downgrades findings is applied by a `dispatch-reviewer` launch, the only role that writes `open_findings`, scoped to recording the ruling and re-checking nothing else. In `unattended` mode the same situations mark the ticket blocked with the reason, and the run continues with the next ticket.
+The answer is passed in the next agent's brief under **Changed during this run**, as a human ruling with the human's words and the date; that agent records it in the ticket (developer: as-built entry; reviewer: the review entry). A ruling that downgrades findings is applied by a `dispatch-reviewer` launch, the only role that writes `open_findings`, scoped to recording the ruling and re-checking nothing else. In `unattended` mode the same situations mark the ticket blocked with the reason, and the run continues with the next ticket.
 
 ## Phase 2 — Run
 
@@ -85,7 +95,7 @@ The run never commits in the checkout the human works in.
 Keep a run table in your context: ticket, branch, base, review rounds, blocking counts per round, head sha, outcome.
 
 12. **Cut the branch.** `git switch -c <id lowercase>-<short-slug> <base>`. The base is the previous ticket's branch, or the first base for the first ticket. Each branch builds on the last, so the stack merges without conflicts in order. A previous ticket that ended blocked still serves as the base; its state is in the report.
-13. **Develop.** Launch `dispatch-developer` with task `develop`, the ticket, worktree, branch and base. Wait for its result.
+13. **Develop.** Launch `dispatch-developer` with task `develop` and a brief per *Briefs*. Wait for its result. Then check the workflow's own visible steps in the ticket: status `In progress` and `assignee` set by the develop workflow, and a dated as-built entry naming the base. A missing step is not repaired by the orchestrator: launch `dispatch-developer` again with task `develop`, naming only the missing step under **Changed during this run**.
     - `outcome: blocked`, or `<base>..HEAD` has no commits: ask (attended) or mark **blocked at development** (unattended). A ticket that stays blocked adds nothing to the stack; delete its branch if it has no commits and continue on the same base.
 14. **Review loop**, `round` from 1 to `max_reviews`:
     1. Launch `dispatch-reviewer` with the ticket, worktree, branch, base, round and — from round 2 — the commit the previous review saw, so it can scope itself to the fix diff. Wait.
@@ -110,6 +120,15 @@ Launch one subagent at a time and wait for it: every step depends on the previou
     - the human rulings made during the run, skipped tickets and why, and which planned risks materialized.
     Merging happens after human review, bottom of the stack first, so each merge is a fast-forward of the reviewed commits. A fix to a lower branch after review means rebasing the branches above it; say which.
 19. Leave the run worktree in place for the review. Remove it (`git worktree remove`) only when the human asks; first remove the `dispatch/wiki` junction with `cmd //c rmdir dispatch\wiki` (or `rm` of the symlink), never by deleting its contents: the junction points at the real vault.
+
+## Guiding the human through the test plans
+
+When the human asks to be guided through a test plan after the run (`guide me through the test plan of US00006`), the human's time is the bottleneck, not the agents':
+
+1. Walk the **whole** plan, one check at a time, in the run worktree's build. A check that fails is recorded as failed — what the human saw, against what the plan expected — and the walk continues with the next check. Do not start a fix in the middle of the walk.
+2. After the last check, summarize the failed checks and ask whether to fix them now. Then launch **one** `dispatch-developer` with task `fix-tests`, listing the failed check numbers under **Changed during this run**.
+3. A fix may run in the background **during** the walk only when it cannot change the build under test and the human can keep testing meanwhile: in a separate worktree of the ticket branch, never in the run worktree the human is testing. Its commits land on the ticket branch after the walk. Otherwise the fix waits for the end of the walk.
+4. After the fix, the human re-runs only the failed checks on the fixed build and ticks them, per *One test plan per story* in `dispatch/invariants.md`. A fix to a ticket low in the stack means rebasing the branches above it; say which.
 
 ## Resume
 

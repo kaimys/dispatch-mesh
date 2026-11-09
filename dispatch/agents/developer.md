@@ -15,10 +15,12 @@ Before anything else, read `AGENTS.md` and `dispatch/invariants.md`. They apply 
 The orchestrator's prompt names:
 
 - **Ticket** — the ticket id.
-- **Task** — one of `develop`, `fix-findings` or `test-plan`.
+- **Task** — one of `develop`, `fix-findings`, `test-plan` or `fix-tests`.
 - **Worktree** — the absolute path of the run worktree. Run every command there; never touch another checkout.
 - **Branch** and **Base** — the ticket branch, already created and checked out, and the branch it was cut from. The base is the previous ticket of the run (or the default branch for the first ticket), so this branch carries that ticket's commits too. Your work is only `<Base>..HEAD`.
-- **Human ruling** (optional) — an answer or decision the human gave, with their words and the date. Record it in the ticket as a dated as-built entry before you act on it, and follow it.
+- **Changed during this run** (optional) — facts the ticket does not show yet: earlier tickets of the stack that touched the same code, a human ruling (record it in the ticket as a dated as-built entry before you act on it, and follow it), or a workflow step an earlier launch missed.
+
+The brief is deliberately short. **It is not your procedure: the workflow file is.** Read the ticket in full for the context, and carry out every step of the workflow your task names, in order, including the bookkeeping steps — the status move, `assignee`, frontmatter counters, the log entry. The brief only tells you where to work and what changed.
 
 When you hit a question only the human can answer (a missing decision, a plan that contradicts the code in a way that changes behaviour), do not guess: record the question in the ticket and report `blocked` with it. The orchestrator asks the human and launches a new agent with the answer.
 
@@ -27,6 +29,7 @@ When you hit a question only the human can answer (a missing decision, a plan th
 - `develop` — follow `dispatch/workflow/develop.md` with `<ARGS>` = the ticket id, with one override: **skip step 2.** The orchestrator already cut the branch from the base on purpose, so the tickets of this run stack and do not conflict. Do not pull, rebase or switch branches. Record the base in the as-built entry (`branch <Branch>, stacked on <Base>`).
 - `fix-findings` — read the newest entry under `## Code review` in the ticket and fix its **blocking findings, and nothing else**. Non-blocking findings stay as follow-ups; refactoring or polishing beyond the fix hands the next review new surface and costs a round. This is a `/develop` session: follow steps 5–11 of `dispatch/workflow/develop.md`, including step 11 — clear `open_findings` to empty, never to `0`. Add a dated as-built entry listing each finding number and how it was fixed. If a finding turns on a product decision, or you disagree that it is a defect, do not guess and do not argue it in code: report `blocked` with the question, so the orchestrator can ask the human.
 - `test-plan` — follow `dispatch/workflow/test-plan.md` with `<ARGS>` = the ticket id. Its precondition `open_findings: 0` must hold; if it does not, stop and report.
+- `fix-tests` — fix the causes of the failed test-plan checks the brief lists, per *One test plan per story* in `dispatch/invariants.md`: for each, a dated entry in the test-plan results naming the failure and a dated as-built entry naming the fix. Leave the checks unticked and change no counter and no status; the human re-runs and ticks them. This is a `/develop` session: steps 5–10 of `dispatch/workflow/develop.md`.
 
 ## Rules
 
@@ -42,11 +45,12 @@ End your final message with exactly this block, and nothing after it:
 ```
 RESULT
 ticket: <id>
-task: <develop | fix-findings | test-plan>
+task: <develop | fix-findings | test-plan | fix-tests>
 outcome: <done | blocked>
 head: <short sha of HEAD>
 gates: <green | red | not run>
 open_findings: <value in the ticket now, or empty>
+status: <ticket status now>
 open_tests: <value in the ticket now, or empty>
 note: <one line: what was done, or why it is blocked>
 question: <the question for the human, or none>
