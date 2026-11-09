@@ -24,8 +24,9 @@ pub const PREVIEW_LIMIT: usize = 10 * 1024 * 1024;
 /// The line diff gives up after this long, so one odd file cannot hang the window.
 pub const DIFF_DEADLINE: Duration = Duration::from_millis(200);
 /// Each column of a comparison, and the common base, shows at most this many
-/// lines; a note under it says how many there are (Kai, 2026-11-09).
-pub const LINE_CAP: usize = 2_000;
+/// lines; a note under it says how many there are (Kai, 2026-11-09: 2,000
+/// at first, 1,000 after the rerun of manual check 4).
+pub const LINE_CAP: usize = 1_000;
 
 /// Where the window puts a time: it replaces this in a text with the time
 /// sent beside it.
@@ -351,7 +352,7 @@ pub struct BaseStrip {
     /// The base itself, at most [`LINE_CAP`] lines; empty when the file did
     /// not exist before.
     pub lines: Vec<Line>,
-    /// "Showing the first 2,000 of N lines." when the base is longer.
+    /// "Showing the first 1,000 of N lines." when the base is longer.
     pub more: Option<String>,
 }
 
@@ -363,7 +364,7 @@ pub enum Body {
     Text {
         current: Vec<Line>,
         other: Vec<Line>,
-        /// "Showing the first 2,000 of N lines." under a column that was cut.
+        /// "Showing the first 1,000 of N lines." under a column that was cut.
         current_more: Option<String>,
         other_more: Option<String>,
         /// Why no line is marked, when the diff gave up.
@@ -1426,7 +1427,7 @@ pub(super) mod tests {
         let view = detail_view(&detail, THIS, (1, 1));
         assert!(started.elapsed() < Duration::from_secs(5));
         let (left, right) = text_lines(&view);
-        // Only the first 2,000 lines of each column travel to the window.
+        // Only the first 1,000 lines of each column travel to the window.
         assert_eq!((left.len(), right.len()), (LINE_CAP, LINE_CAP));
         // The diff gave up, so no line is marked and the view says why.
         assert!(left.iter().chain(right).all(|line| !line.changed));
@@ -1438,7 +1439,7 @@ pub(super) mod tests {
                 ..
             } => {
                 assert_eq!(*marks_unavailable, Some(MARKS_UNAVAILABLE));
-                let note = Some("Showing the first 2,000 of 40,000 lines.".to_owned());
+                let note = Some("Showing the first 1,000 of 40,000 lines.".to_owned());
                 assert_eq!((current_more, other_more), (&note, &note));
             }
             body => panic!("not a comparison: {body:?}"),
@@ -1468,7 +1469,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn exactly_two_thousand_lines_are_shown_whole_without_a_note() {
+    fn exactly_one_thousand_lines_are_shown_whole_without_a_note() {
         let current = numbered(LINE_CAP);
         let other = current.replace(
             "row 7
@@ -1484,16 +1485,16 @@ pub(super) mod tests {
         );
         let view = detail_view(&detail, THIS, (1, 1));
         let (left, right) = text_lines(&view);
-        assert_eq!((left.len(), right.len()), (2_000, 2_000));
-        assert_eq!(left.last().unwrap().text, "row 2000");
+        assert_eq!((left.len(), right.len()), (1_000, 1_000));
+        assert_eq!(left.last().unwrap().text, "row 1000");
         assert_eq!(mores(&view), (None, None));
         let base = view.base.as_ref().unwrap();
-        assert_eq!((base.lines.len(), &base.more), (2_000, &None));
+        assert_eq!((base.lines.len(), &base.more), (1_000, &None));
         assert!(left[6].changed && right[6].changed);
     }
 
     #[test]
-    fn two_thousand_and_one_lines_show_the_first_two_thousand_and_say_so() {
+    fn one_thousand_and_one_lines_show_the_first_thousand_and_say_so() {
         let current = numbered(LINE_CAP + 1);
         // Only the other version is long; the current one fits.
         let short = numbered(10);
@@ -1505,13 +1506,13 @@ pub(super) mod tests {
         );
         let view = detail_view(&detail, THIS, (1, 1));
         let (left, right) = text_lines(&view);
-        assert_eq!((left.len(), right.len()), (10, 2_000));
-        assert_eq!(right.last().unwrap().number, 2_000);
+        assert_eq!((left.len(), right.len()), (10, 1_000));
+        assert_eq!(right.last().unwrap().number, 1_000);
         assert_eq!(
             mores(&view),
             (
                 None,
-                Some("Showing the first 2,000 of 2,001 lines.".to_owned())
+                Some("Showing the first 1,000 of 1,001 lines.".to_owned())
             )
         );
         // The marks come from the whole files: the lines past the cut are
@@ -1540,7 +1541,7 @@ pub(super) mod tests {
         assert_eq!(base.lines.len(), LINE_CAP);
         assert_eq!(
             base.more.as_deref(),
-            Some("Showing the first 2,000 of 12,345 lines.")
+            Some("Showing the first 1,000 of 12,345 lines.")
         );
         assert_eq!(mores(&view), (None, None));
     }
@@ -1549,6 +1550,7 @@ pub(super) mod tests {
     fn line_counts_are_grouped_by_thousands() {
         assert_eq!(grouped(7), "7");
         assert_eq!(grouped(999), "999");
+        assert_eq!(grouped(1_000), "1,000");
         assert_eq!(grouped(2_000), "2,000");
         assert_eq!(grouped(40_000), "40,000");
         assert_eq!(grouped(1_234_567), "1,234,567");

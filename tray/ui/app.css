@@ -149,6 +149,14 @@ button:disabled { opacity: .6; cursor: default; }
 .detail { min-height: calc(100vh - 1px); display: flex; flex-direction: column; }
 .detail-body { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
 .detail .content { flex: 1; }
+/* The top row (breadcrumb) sticks to the top of the window and the footer to
+   the bottom while the comparison scrolls (Kai, 2026-11-09). The scroll
+   margin keeps what is scrolled to or focused in the content, such as a
+   column or a button, clear of both; --detail-foot follows the footer's
+   height (app.js). It is set on the content only: on the root it would also
+   scroll the page when focus moves to the bars' own buttons. */
+.detail > .top { position: sticky; top: 0; z-index: 1; }
+.detail .content * { scroll-margin-top: 52px; scroll-margin-bottom: calc(var(--detail-foot, 64px) + 8px); }
 .crumb { background: none; border: 0; padding: 4px 6px; margin-left: -6px; border-radius: 4px; display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 14px; }
 .crumb:hover { background: var(--ground); }
 .crumb .of { color: var(--text-3); }
@@ -185,7 +193,7 @@ button:disabled { opacity: .6; cursor: default; }
 .facts { margin: 0; padding: 0 16px 16px; display: grid; grid-template-columns: auto 1fr; gap: 6px 24px; }
 .facts dt { color: var(--text-3); }
 .facts dd { margin: 0; overflow-wrap: anywhere; }
-.footer { position: sticky; bottom: 0; background: var(--surface); border-top: 1px solid var(--line-soft); padding: 12px 16px; display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+.footer { position: sticky; bottom: 0; z-index: 1; background: var(--surface); border-top: 1px solid var(--line-soft); padding: 12px 16px; display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
 .footer .reassure { color: var(--text-2); }
 .footer .buttons { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
 @media (max-width: 760px) { .columns { grid-template-columns: 1fr; } }

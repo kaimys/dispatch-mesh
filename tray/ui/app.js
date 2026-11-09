@@ -20,6 +20,15 @@ const conflictOpen = new Map(); // workspace id -> the conflict open in detail (
 const notices = new Map(); // workspace id -> a dismissible line, like the line after a choice
 let wide = false; // whether the window is in the widened detail layout
 let lastView = ""; // identifies the view last drawn, to keep its scroll position
+// The sticky footer's height, for the scroll margin that keeps focused or
+// scrolled-to content clear of it (app.css, .detail). It grows when it wraps.
+const footerSize = new ResizeObserver((entries) => {
+  for (const entry of entries) {
+    if (entry.target.isConnected) {
+      document.documentElement.style.setProperty("--detail-foot", `${entry.target.offsetHeight}px`);
+    }
+  }
+});
 
 const SVG = "http://www.w3.org/2000/svg";
 
@@ -360,6 +369,7 @@ function closeConflict(wsId) {
   const state = conflictOpen.get(wsId);
   if (!state) return;
   state.closed = true;
+  if (state.parts) footerSize.unobserve(state.parts.footer);
   for (const url of state.urls) URL.revokeObjectURL(url);
   conflictOpen.delete(wsId);
 }
@@ -450,7 +460,7 @@ async function refreshNote(wsId, state) {
   state.refreshing = false;
 }
 
-// A column holds at most the model's first 2,000 lines; `more` says so.
+// A column holds at most the model's first 1,000 lines (LINE_CAP); `more` says so.
 function codeColumn(panel, lines, more) {
   return el("div", { class: "code", tabindex: "0", role: "region", "aria-label": `${panel.title}, ${more || `${lines.length} lines`}` },
     ...lines.map((line) => el("div", { class: line.changed ? "line changed" : "line" },
@@ -573,6 +583,10 @@ function buildDetail(ws, state) {
     use: button("use-other", "other", false),
     keep: button("keep-current", "current", true),
   };
+  state.parts.footer = el("div", { class: "footer" },
+    el("p", { class: "reassure" }, view.footer),
+    el("div", { class: "buttons" }, state.parts.use, state.parts.keep));
+  footerSize.observe(state.parts.footer);
   return el("div", { class: "detail" },
     el("div", { class: "top" },
       el("button", { class: "crumb", "data-key": "conflict-back", onclick: () => backToList(ws) },
@@ -580,9 +594,7 @@ function buildDetail(ws, state) {
       el("span", { class: "crumb of" }, `/ ${view.position}`),
       el("span", { class: "workspace ellipsis" }, ws.name)),
     el("div", { class: "content" }, state.parts.notice, state.body, state.parts.after),
-    el("div", { class: "footer" },
-      el("p", { class: "reassure" }, view.footer),
-      el("div", { class: "buttons" }, state.parts.use, state.parts.keep)));
+    state.parts.footer);
 }
 
 function updateDetail(ws, state) {
