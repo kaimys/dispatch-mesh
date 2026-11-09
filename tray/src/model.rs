@@ -804,6 +804,31 @@ pub fn widen(
     }
 }
 
+/// The geometry Back restores (US00006, Kai's ruling of 2026-11-09): the
+/// compact window's inner size and position from right before the detail
+/// opened, fitted into the current work area with the same rule as
+/// [`widen`], so a monitor or scale change in between cannot leave it off
+/// screen. `None` while the window is maximized: it is never moved or
+/// resized. `frame` is the current title bar and border, `(width, height)`.
+pub fn restore_compact(
+    maximized: bool,
+    remembered: Widened,
+    frame: (u32, u32),
+    area_position: (i32, i32),
+    area_size: (u32, u32),
+) -> Option<Widened> {
+    (!maximized).then(|| {
+        widen(
+            remembered.inner,
+            frame,
+            remembered.position,
+            (0, 0),
+            area_position,
+            area_size,
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1737,6 +1762,53 @@ docs/b.md"
             (1920, 1040),
         );
         assert_eq!(left.position, (-1900, 50));
+    }
+
+    #[test]
+    fn back_restores_the_compact_size_and_position_inside_the_work_area() {
+        let area = ((0, 0), (1920, 1040));
+        let compact = Widened {
+            inner: (440, 640),
+            position: (1400, 300),
+        };
+        // Where it was, as it was: the detail had moved it left and up.
+        assert_eq!(
+            restore_compact(false, compact, (16, 39), area.0, area.1),
+            Some(compact)
+        );
+        // A second monitor left of the primary has a negative origin.
+        let left = Widened {
+            inner: (440, 640),
+            position: (-1800, 100),
+        };
+        assert_eq!(
+            restore_compact(false, left, (16, 39), (-1920, 0), (1920, 1040)),
+            Some(left)
+        );
+        // The scale or monitor changed while the detail was open: the old
+        // spot now runs past the right and bottom edges, so it is clamped.
+        let small = ((0, 0), (960, 520));
+        assert_eq!(
+            restore_compact(false, compact, (16, 39), small.0, small.1),
+            Some(Widened {
+                inner: (440, 520 - 39),
+                position: (960 - (440 + 16), 0),
+            })
+        );
+        // A spot left of a work area that no longer reaches there.
+        let gone = Widened {
+            inner: (440, 640),
+            position: (-1800, 100),
+        };
+        assert_eq!(
+            restore_compact(false, gone, (16, 39), area.0, area.1).map(|g| g.position),
+            Some((0, 100))
+        );
+        // A maximized window is never moved or resized.
+        assert_eq!(
+            restore_compact(true, compact, (16, 39), area.0, area.1),
+            None
+        );
     }
 
     #[test]

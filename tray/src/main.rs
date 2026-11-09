@@ -125,57 +125,71 @@ async fn resolve_conflict(
         .map_err(|error| format!("{error:#}"))
 }
 
-/// The size the window had before conflict detail widened it, to restore on
-/// Back.
+/// The inner size and position the window had right before conflict detail
+/// widened it, to restore on Back.
 #[derive(Default)]
-struct Compact(std::sync::Mutex<Option<tauri::PhysicalSize<u32>>>);
+struct Compact(std::sync::Mutex<Option<model::Widened>>);
 
 /// The detail layout's inner size in logical pixels (US00006, design spec).
 const DETAIL_SIZE: (f64, f64) = (1000.0, 760.0);
 
-/// Widen the window for conflict detail, or restore its compact size. A
-/// maximized window is left alone either way (see [`show_window`]); a widened
-/// one is kept inside the work area like the window at launch.
+/// Widen the window for conflict detail, or restore its compact size and
+/// position. A maximized window is left alone either way (see
+/// [`show_window`]); both layouts are kept inside the work area like the
+/// window at launch. Moving between conflicts keeps the first remembered
+/// compact geometry.
 #[tauri::command]
 fn set_layout(window: tauri::WebviewWindow, memory: State<Compact>, layout: String) {
-    if window.is_maximized().unwrap_or(true) {
+    let maximized = window.is_maximized().unwrap_or(true);
+    let (Ok(Some(monitor)), Ok(position), Ok(outer), Ok(inner), Ok(scale)) = (
+        window.current_monitor(),
+        window.outer_position(),
+        window.outer_size(),
+        window.inner_size(),
+        window.scale_factor(),
+    ) else {
         return;
-    }
+    };
+    let frame = (outer.width - inner.width, outer.height - inner.height);
+    let area = monitor.work_area();
+    let area = (
+        (area.position.x, area.position.y),
+        (area.size.width, area.size.height),
+    );
     let mut remembered = memory.0.lock().unwrap_or_else(|e| e.into_inner());
-    match layout.as_str() {
+    let fit = match layout.as_str() {
         "detail" => {
-            let (Ok(Some(monitor)), Ok(position), Ok(outer), Ok(inner), Ok(scale)) = (
-                window.current_monitor(),
-                window.outer_position(),
-                window.outer_size(),
-                window.inner_size(),
-                window.scale_factor(),
-            ) else {
+            if maximized {
                 return;
-            };
-            remembered.get_or_insert(inner);
-            let area = monitor.work_area();
-            let fit = model::widen(
+            }
+            remembered.get_or_insert(model::Widened {
+                inner: (inner.width, inner.height),
+                position: (position.x, position.y),
+            });
+            model::widen(
                 (inner.width, inner.height),
-                (outer.width - inner.width, outer.height - inner.height),
+                frame,
                 (position.x, position.y),
                 (
                     (DETAIL_SIZE.0 * scale).round() as u32,
                     (DETAIL_SIZE.1 * scale).round() as u32,
                 ),
-                (area.position.x, area.position.y),
-                (area.size.width, area.size.height),
-            );
-            let _ = window.set_size(tauri::PhysicalSize::new(fit.inner.0, fit.inner.1));
-            let _ =
-                window.set_position(tauri::PhysicalPosition::new(fit.position.0, fit.position.1));
+                area.0,
+                area.1,
+            )
         }
         _ => {
-            if let Some(size) = remembered.take() {
-                let _ = window.set_size(size);
-            }
+            let Some(fit) = (*remembered).and_then(|compact| {
+                model::restore_compact(maximized, compact, frame, area.0, area.1)
+            }) else {
+                return;
+            };
+            *remembered = None;
+            fit
         }
-    }
+    };
+    let _ = window.set_size(tauri::PhysicalSize::new(fit.inner.0, fit.inner.1));
+    let _ = window.set_position(tauri::PhysicalPosition::new(fit.position.0, fit.position.1));
 }
 
 /// Open Explorer with a saved copy selected. The window names the copy by
