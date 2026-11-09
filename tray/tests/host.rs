@@ -578,6 +578,7 @@ mod conflicts {
         host.start_all();
         let id = id_of(&listed(&host, 1), "note.md");
         assert!(host.conflict_detail(0, &id).unwrap().note.is_none());
+        assert_eq!(host.conflict_note(0, &id).unwrap(), None);
 
         std::fs::write(root.join("note.md"), "BOB again\ntwo\nthree\n").unwrap();
         let started = Instant::now();
@@ -593,6 +594,7 @@ mod conflicts {
             std::thread::sleep(Duration::from_millis(50));
         };
         assert!(!view.can_choose);
+        assert_eq!(host.conflict_note(0, &id).unwrap(), view.note);
         let error = host.resolve_conflict(0, &id, Choice::Other).unwrap_err();
         assert!(format!("{error:#}").contains("newer edits"), "{error:#}");
         host.quit();
@@ -623,6 +625,7 @@ mod conflicts {
                 w[0].state == WorkspaceState::AlreadyRunning
             });
             assert!(host.conflict_detail(0, &id).is_err());
+            assert!(host.conflict_note(0, &id).is_err());
             assert!(host.conflict_preview(0, &id, "current").is_err());
             assert!(host.resolve_conflict(0, &id, Choice::Current).is_err());
             host.quit();
@@ -633,6 +636,7 @@ mod conflicts {
         host.start_all();
         listed(&host, 1);
         assert!(host.conflict_detail(0, "no-such-conflict").is_err());
+        assert!(host.conflict_note(0, "no-such-conflict").is_err());
         assert!(
             host.conflict_preview(0, "no-such-conflict", "current")
                 .is_err()

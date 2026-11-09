@@ -429,19 +429,19 @@ async function choose(ws, state, choice) {
   }
 }
 
-// Read the open conflict again for a save made after it was recorded, so the
-// note and the buttons follow the folder. Only the note changes; the versions
-// shown stay as they were loaded.
+// Ask again whether the file was saved after the conflict was recorded, so
+// the note and the buttons follow the folder. Only the note is read (no
+// versions, no diff); the versions shown stay as they were loaded.
 async function refreshNote(wsId, state) {
   if (state.closed || state.busy !== null || !state.view || state.refreshing) return;
   state.refreshing = true;
   try {
-    const fresh = await invoke("conflict_detail", { id: wsId, conflict: state.id });
+    const note = await invoke("conflict_note", { id: wsId, conflict: state.id });
     const before = state.view.note ? state.view.note.time : null;
-    const after = fresh.note ? fresh.note.time : null;
+    const after = note ? note.time : null;
     if (!state.closed && state.busy === null && before !== after) {
-      state.view.note = fresh.note;
-      state.view.can_choose = fresh.can_choose;
+      state.view.note = note;
+      state.view.can_choose = !note;
       render();
     }
   } catch (error) {
@@ -450,8 +450,9 @@ async function refreshNote(wsId, state) {
   state.refreshing = false;
 }
 
-function codeColumn(panel, lines) {
-  return el("div", { class: "code", tabindex: "0", role: "region", "aria-label": `${panel.title}, ${lines.length} lines` },
+// A column holds at most the model's first 2,000 lines; `more` says so.
+function codeColumn(panel, lines, more) {
+  return el("div", { class: "code", tabindex: "0", role: "region", "aria-label": `${panel.title}, ${more || `${lines.length} lines`}` },
     ...lines.map((line) => el("div", { class: line.changed ? "line changed" : "line" },
       el("span", { class: "num", "aria-hidden": "true" }, String(line.number)),
       line.changed
@@ -467,7 +468,8 @@ function versionColumn(view, side, other) {
   if (panel.placeholder) {
     content = el("p", { class: "placeholder-box" }, stamp(panel.placeholder));
   } else if (body.kind === "text") {
-    content = codeColumn(panel, body[side]);
+    const more = body[`${side}_more`];
+    content = [codeColumn(panel, body[side], more), more ? el("p", { class: "more" }, more) : null];
   } else {
     content = [
       el("div", { class: "preview" },
@@ -506,7 +508,8 @@ function conflictBody(state) {
       view.base.lines.length
         ? el("div", { class: "base-text", tabindex: "0", role: "region", "aria-label": view.base.label },
           ...view.base.lines.map((line) => el("div", {}, line.text || " ")))
-        : null);
+        : null,
+      view.base.more ? el("p", { class: "more" }, view.base.more) : null);
     toggle = el("button", {
       class: "secondary",
       "data-key": "toggle-base",
@@ -536,39 +539,77 @@ function conflictBody(state) {
 
 function conflictDetail(ws, state) {
   const view = state.view;
-  const top = el("div", { class: "top" },
-    el("button", { class: "crumb", "data-key": "conflict-back", onclick: () => backToList(ws) },
-      el("span", { "aria-hidden": "true" }, "‹"), "Conflicts"),
-    view ? el("span", { class: "crumb of" }, `/ ${view.position}`) : null,
-    el("span", { class: "workspace ellipsis" }, ws.name));
   if (!view) {
+    const top = el("div", { class: "top" },
+      el("button", { class: "crumb", "data-key": "conflict-back", onclick: () => backToList(ws) },
+        el("span", { "aria-hidden": "true" }, "‹"), "Conflicts"),
+      el("span", { class: "workspace ellipsis" }, ws.name));
     return [el("div", { class: "detail" }, top,
       el("div", { class: "content" },
         state.error
           ? el("p", { class: "error", role: "alert" }, state.error)
           : el("p", { class: "muted" }, "Loading the conflict…")))];
   }
+  if (!state.root) state.root = buildDetail(ws, state);
+  updateDetail(ws, state);
+  return [state.root];
+}
+
+// The loaded detail, built once per opened conflict. Later renders (each
+// runner snapshot, the 30 s timer) only update its notice, note, error and
+// buttons through updateDetail, so the comparison is neither rebuilt nor
+// taken off the page, and the scroll position stays where it is.
+function buildDetail(ws, state) {
+  const view = state.view;
   if (!state.body) state.body = conflictBody(state);
-  const busy = state.busy !== null;
-  const button = (key, choice, label, primary) => el("button", {
+  const button = (key, choice, primary) => el("button", {
     class: primary ? "primary" : "secondary",
     "data-key": key,
-    ...(busy || !view.can_choose ? { disabled: "" } : {}),
-    ...(state.busy === choice ? { "aria-busy": "true" } : {}),
-    ...(view.note ? { "aria-describedby": "later-edit" } : {}),
     onclick: () => choose(ws, state, choice),
-  }, state.busy === choice ? "Choosing…" : label);
-  return [el("div", { class: "detail" }, top,
-    el("div", { class: "content" },
-      noticeLine(ws),
-      state.body,
-      view.note ? el("p", { class: "notice", id: "later-edit" }, stamp(view.note)) : null,
-      state.error ? el("p", { class: "error", role: "alert" }, state.error) : null),
+  });
+  state.parts = {
+    notice: el("div", { class: "slot" }),
+    after: el("div", { class: "slot" }),
+    use: button("use-other", "other", false),
+    keep: button("keep-current", "current", true),
+  };
+  return el("div", { class: "detail" },
+    el("div", { class: "top" },
+      el("button", { class: "crumb", "data-key": "conflict-back", onclick: () => backToList(ws) },
+        el("span", { "aria-hidden": "true" }, "‹"), "Conflicts"),
+      el("span", { class: "crumb of" }, `/ ${view.position}`),
+      el("span", { class: "workspace ellipsis" }, ws.name)),
+    el("div", { class: "content" }, state.parts.notice, state.body, state.parts.after),
     el("div", { class: "footer" },
       el("p", { class: "reassure" }, view.footer),
-      el("div", { class: "buttons" },
-        button("use-other", "other", view.use_label, false),
-        button("keep-current", "current", view.keep_label, true))))];
+      el("div", { class: "buttons" }, state.parts.use, state.parts.keep)));
+}
+
+function updateDetail(ws, state) {
+  const view = state.view;
+  const parts = state.parts;
+  const notice = notices.get(ws.id) || "";
+  if (parts.noticeText !== notice) {
+    parts.noticeText = notice;
+    parts.notice.replaceChildren(...[noticeLine(ws)].filter(Boolean));
+  }
+  const note = view.note ? stamp(view.note) : "";
+  const after = `${note}\n${state.error || ""}`;
+  if (parts.afterText !== after) {
+    parts.afterText = after;
+    parts.after.replaceChildren(...[
+      note ? el("p", { class: "notice", id: "later-edit" }, note) : null,
+      state.error ? el("p", { class: "error", role: "alert" }, state.error) : null,
+    ].filter(Boolean));
+  }
+  const busy = state.busy !== null;
+  for (const [node, choice, label] of [[parts.use, "other", view.use_label], [parts.keep, "current", view.keep_label]]) {
+    node.disabled = busy || !view.can_choose;
+    if (state.busy === choice) node.setAttribute("aria-busy", "true"); else node.removeAttribute("aria-busy");
+    if (note) node.setAttribute("aria-describedby", "later-edit"); else node.removeAttribute("aria-describedby");
+    const text = state.busy === choice ? "Choosing…" : label;
+    if (node.textContent !== text) node.textContent = text;
+  }
 }
 
 function topRow(several, ws) {
@@ -666,28 +707,34 @@ function render() {
   closeGoneConflicts();
   const several = workspaces.length > 1;
   const shown = shownWorkspace();
+  const open = shown ? conflictOpen.get(shown.id) : null;
+  // Read before building: building may move nodes that are on the page now.
+  const viewKey = `${shown ? shown.id : "-"}|${shown ? tabs.get(shown.id) : ""}|${open ? open.id + (open.view ? "+" : "") : ""}`;
+  const scrollY = viewKey === lastView ? window.scrollY : 0;
+  lastView = viewKey;
   let content;
   if (workspaces.length === 0) content = empty();
   else if (!several) content = detail(workspaces[0], false);
   else content = shown ? detail(shown, true) : list();
+  content = content.filter(Boolean);
   // The window widens for conflict detail and returns to its compact size on Back.
-  const open = shown ? conflictOpen.get(shown.id) : null;
   if (Boolean(open) !== wide) {
     wide = Boolean(open);
     invoke("set_layout", { layout: wide ? "detail" : "compact" }).catch(() => {});
   }
-  const viewKey = `${shown ? shown.id : "-"}|${shown ? tabs.get(shown.id) : ""}|${open ? open.id + (open.view ? "+" : "") : ""}`;
-  const scrollY = viewKey === lastView ? window.scrollY : 0;
-  lastView = viewKey;
-  const focusedId = document.activeElement && document.activeElement.dataset
-    ? document.activeElement.dataset.key : undefined;
-  app.replaceChildren(...content.filter(Boolean));
-  window.scrollTo(0, scrollY);
-  app.setAttribute("aria-busy", "false");
-  if (focusedId) {
-    const again = app.querySelector(`[data-key="${focusedId}"]`);
-    if (again) again.focus();
+  // An open conflict detail updates itself in place (updateDetail); anything
+  // else is drawn anew, keeping the scroll position and focus of the same view.
+  if (!(content.length === 1 && app.childElementCount === 1 && app.firstElementChild === content[0])) {
+    const focusedId = document.activeElement && document.activeElement.dataset
+      ? document.activeElement.dataset.key : undefined;
+    app.replaceChildren(...content);
+    window.scrollTo(0, scrollY);
+    if (focusedId) {
+      const again = app.querySelector(`[data-key="${focusedId}"]`);
+      if (again) again.focus({ preventScroll: true });
+    }
   }
+  app.setAttribute("aria-busy", "false");
   announceChanges();
 }
 

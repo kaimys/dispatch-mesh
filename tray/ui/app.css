@@ -70,7 +70,12 @@
 }
 
 * { box-sizing: border-box; }
-html, body { margin: 0; background: var(--ground); color: var(--text); overflow-x: hidden; }
+/* Only the root hides overflow: `hidden` on body as well would make body a
+   scroll container that never scrolls, so sticky parts such as the conflict
+   footer would stick to it instead of the window. `clip` makes none. */
+html, body { margin: 0; background: var(--ground); color: var(--text); }
+html { overflow-x: hidden; }
+body { overflow-x: clip; }
 body { font: 13px/1.45 var(--sans); }
 p { margin: 0; }
 button { font: inherit; color: inherit; }
@@ -170,6 +175,9 @@ button:disabled { opacity: .6; cursor: default; }
 .code .num { flex: none; width: 3.5em; text-align: right; padding-right: 8px; color: var(--text-3); }
 .code .mark { flex: none; width: 1.5em; color: var(--attention-text); }
 .code .line.changed { background: var(--attention-card); }
+.more { font-size: 12px; color: var(--text-3); padding: 0 16px 12px; }
+.base-strip .more { padding: 0; }
+.slot { display: contents; }
 .placeholder-box { border-top: 1px solid var(--line-soft); padding: 16px; color: var(--text-2); }
 .preview { border-top: 1px solid var(--line-soft); margin: 0; padding: 16px; display: grid; place-items: center; min-height: 160px; color: var(--text-2); }
 .preview .frame { width: 100%; min-height: 160px; display: grid; place-items: center; border-radius: 6px; border: 1px solid var(--line-soft); background-color: var(--surface); background-image: conic-gradient(var(--base-strip) 25%, transparent 0 50%, var(--base-strip) 0 75%, transparent 0); background-size: 16px 16px; overflow: hidden; }

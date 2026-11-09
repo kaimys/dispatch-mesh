@@ -226,6 +226,7 @@ fn conflict_detail_returns_the_exact_versions_and_the_base_history() {
     assert_eq!(detail.other.as_deref(), Some(&b"ALICE\ntwo\nthree\n"[..]));
     assert_eq!(detail.status, bob.status_snapshot().unresolved_conflicts[0]);
     assert_eq!(detail.edited_after, None);
+    assert_eq!(bob.conflict_edited_after(&id).unwrap(), None);
     // Bob's version is a draft, so no commit on main made it.
     assert_eq!(detail.current_history, None);
     // The base is the commit Alice published first.
@@ -255,6 +256,7 @@ fn detail_reports_a_later_save_and_resolving_is_then_refused() {
     bob.capture_at(created + 30).unwrap();
     let detail = bob.conflict_detail(&id).unwrap();
     assert_eq!(detail.edited_after, Some(created + 30));
+    assert_eq!(bob.conflict_edited_after(&id).unwrap(), Some(created + 30));
     let error = bob.resolve(&id, true).unwrap_err();
     assert!(format!("{error:#}").contains("newer edits"), "{error:#}");
     assert_eq!(bob.unresolved().count(), 1, "nothing was recorded");
@@ -267,6 +269,7 @@ fn a_resolved_conflict_has_no_detail() {
     let id = bob.unresolved().next().unwrap().id.clone();
     bob.resolve(&id, false).unwrap();
     assert!(bob.conflict_detail(&id).is_err());
+    assert!(bob.conflict_edited_after(&id).is_err());
     assert!(bob.status_snapshot().unresolved_conflicts.is_empty());
 }
 

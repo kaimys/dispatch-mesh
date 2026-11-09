@@ -6,7 +6,7 @@
 
 use crate::model::{
     Workspace, WorkspaceState,
-    conflicts::{self, Choice, ConflictDetailView, Resolved},
+    conflicts::{self, Choice, ConflictDetailView, Resolved, Stamped},
 };
 use anyhow::{Context, Result, bail};
 use dispatch_mesh::{
@@ -345,6 +345,16 @@ impl Host {
             &status.device,
             (at + 1, list.len()),
         ))
+    }
+
+    /// Only the later-save note of one unresolved conflict, for the open
+    /// detail to follow the folder on every snapshot. Unlike
+    /// [`conflict_detail`](Self::conflict_detail) it runs no Git, no diff and
+    /// sends no versions.
+    pub fn conflict_note(&self, id: usize, conflict: &str) -> Result<Option<Stamped>> {
+        let (path, _) = self.listed_conflict(id, conflict)?;
+        let edited_after = Engine::inspect(&path)?.conflict_edited_after(conflict)?;
+        Ok(conflicts::later_edit_note(edited_after))
     }
 
     /// The bytes of one side (`current`, `other` or `base`) with their image

@@ -10,7 +10,7 @@ use dispatch_mesh_tray::{
     host::Host,
     model::{
         self, Workspace,
-        conflicts::{Choice, ConflictDetailView, Resolved},
+        conflicts::{Choice, ConflictDetailView, Resolved, Stamped},
     },
 };
 use std::{path::PathBuf, sync::Arc};
@@ -68,6 +68,21 @@ async fn conflict_detail(
 ) -> Result<ConflictDetailView, String> {
     let host = Arc::clone(&state.host);
     tauri::async_runtime::spawn_blocking(move || host.conflict_detail(id, &conflict))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// The later-save note of the open conflict, or `None`: what the window
+/// re-reads on each snapshot instead of the whole detail.
+#[tauri::command]
+async fn conflict_note(
+    state: State<'_, Tray>,
+    id: usize,
+    conflict: String,
+) -> Result<Option<Stamped>, String> {
+    let host = Arc::clone(&state.host);
+    tauri::async_runtime::spawn_blocking(move || host.conflict_note(id, &conflict))
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| format!("{error:#}"))
@@ -286,6 +301,7 @@ fn main() {
             finish_session,
             show_saved_copy,
             conflict_detail,
+            conflict_note,
             conflict_preview,
             resolve_conflict,
             set_layout

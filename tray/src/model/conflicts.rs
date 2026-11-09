@@ -23,6 +23,9 @@ pub const COMPARE_LIMIT: usize = 1024 * 1024;
 pub const PREVIEW_LIMIT: usize = 10 * 1024 * 1024;
 /// The line diff gives up after this long, so one odd file cannot hang the window.
 pub const DIFF_DEADLINE: Duration = Duration::from_millis(200);
+/// Each column of a comparison, and the common base, shows at most this many
+/// lines; a note under it says how many there are (Kai, 2026-11-09).
+pub const LINE_CAP: usize = 2_000;
 
 /// Where the window puts a time: it replaces this in a text with the time
 /// sent beside it.
@@ -345,17 +348,24 @@ pub struct BaseStrip {
     pub label: &'static str,
     /// "Before both changes", with where and when it is known from.
     pub text: Stamped,
-    /// The base itself; empty when the file did not exist before.
+    /// The base itself, at most [`LINE_CAP`] lines; empty when the file did
+    /// not exist before.
     pub lines: Vec<Line>,
+    /// "Showing the first 2,000 of N lines." when the base is longer.
+    pub more: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Body {
-    /// Two columns of numbered lines with their changed lines marked.
+    /// Two columns of numbered lines with their changed lines marked, each
+    /// cut to its first [`LINE_CAP`] lines.
     Text {
         current: Vec<Line>,
         other: Vec<Line>,
+        /// "Showing the first 2,000 of N lines." under a column that was cut.
+        current_more: Option<String>,
+        other_more: Option<String>,
         /// Why no line is marked, when the diff gave up.
         marks_unavailable: Option<&'static str>,
     },
@@ -395,6 +405,35 @@ fn lines_of(text: &str) -> Vec<Line> {
             changed: false,
         })
         .collect()
+}
+
+/// `1234567` as "1,234,567".
+fn grouped(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// A column cut to its first [`LINE_CAP`] lines, with the note saying so when
+/// anything was left out. Marks are made before the cut, on the whole file.
+fn capped(mut lines: Vec<Line>) -> (Vec<Line>, Option<String>) {
+    let total = lines.len();
+    if total <= LINE_CAP {
+        return (lines, None);
+    }
+    lines.truncate(LINE_CAP);
+    let note = format!(
+        "Showing the first {} of {} lines.",
+        grouped(LINE_CAP),
+        grouped(total)
+    );
+    (lines, Some(note))
 }
 
 /// The two versions as numbered lines, with the differing lines marked.
@@ -610,6 +649,19 @@ fn summary(status: &ConflictStatus, binary_view: bool, image: bool, this_device:
     }
 }
 
+/// The note shown once the file was saved again after the conflict was
+/// recorded, at that save's time. While it shows, neither choice works.
+pub fn later_edit_note(edited_after: Option<u64>) -> Option<Stamped> {
+    edited_after.map(|time| {
+        Stamped::at(
+            format!(
+                "You saved this file again at {TIME}, after the conflict was recorded. Your edit is safe. Choosing a version is possible once the file matches the current version again."
+            ),
+            time,
+        )
+    })
+}
+
 /// The detail of one conflict, `n` of `of` in the list order.
 pub fn detail_view(
     detail: &ConflictDetail,
@@ -666,30 +718,35 @@ pub fn detail_view(
                     false,
                 ),
             };
-        let strip = match (&detail.base, &detail.base_history) {
-            (None, _) => BaseStrip {
-                label: COMMON_BASE,
-                text: Stamped::plain("Before both changes · the file did not exist"),
-                lines: Vec::new(),
-            },
-            (Some(bytes), Some(commit)) => BaseStrip {
-                label: COMMON_BASE,
-                text: Stamped::at(
-                    format!("Before both changes · shared history, {TIME}"),
-                    commit.time,
-                ),
-                lines: lines_of(&String::from_utf8_lossy(bytes)),
-            },
-            (Some(bytes), None) => BaseStrip {
-                label: COMMON_BASE,
-                text: Stamped::plain("Before both changes"),
-                lines: lines_of(&String::from_utf8_lossy(bytes)),
-            },
+        let text = match (&detail.base, &detail.base_history) {
+            (None, _) => Stamped::plain("Before both changes · the file did not exist"),
+            (Some(_), Some(commit)) => Stamped::at(
+                format!("Before both changes · shared history, {TIME}"),
+                commit.time,
+            ),
+            (Some(_), None) => Stamped::plain("Before both changes"),
         };
+        let (lines, more) = capped(
+            detail
+                .base
+                .as_deref()
+                .map(|bytes| lines_of(&String::from_utf8_lossy(bytes)))
+                .unwrap_or_default(),
+        );
+        let strip = BaseStrip {
+            label: COMMON_BASE,
+            text,
+            lines,
+            more,
+        };
+        let (current_lines, current_more) = capped(current_lines);
+        let (other_lines, other_more) = capped(other_lines);
         (
             Body::Text {
                 current: current_lines,
                 other: other_lines,
+                current_more,
+                other_more,
                 marks_unavailable: unavailable.then_some(MARKS_UNAVAILABLE),
             },
             Some(strip),
@@ -700,14 +757,7 @@ pub fn detail_view(
         (Body::Binary, None)
     };
 
-    let note = detail.edited_after.map(|time| {
-        Stamped::at(
-            format!(
-                "You saved this file again at {TIME}, after the conflict was recorded. Your edit is safe. Choosing a version is possible once the file matches the current version again."
-            ),
-            time,
-        )
-    });
+    let note = later_edit_note(detail.edited_after);
     ConflictDetailView {
         id: status.id.clone(),
         path: status.path.clone(),
@@ -1207,6 +1257,9 @@ pub(super) mod tests {
                 1_200
             ))
         );
+        // The window follows a later save through this note alone.
+        assert_eq!(later_edit_note(Some(1_200)), view.note);
+        assert_eq!(later_edit_note(None), None);
     }
 
     #[test]
@@ -1373,14 +1426,131 @@ pub(super) mod tests {
         let view = detail_view(&detail, THIS, (1, 1));
         assert!(started.elapsed() < Duration::from_secs(5));
         let (left, right) = text_lines(&view);
-        assert_eq!((left.len(), right.len()), (40_000, 40_000));
+        // Only the first 2,000 lines of each column travel to the window.
+        assert_eq!((left.len(), right.len()), (LINE_CAP, LINE_CAP));
         // The diff gave up, so no line is marked and the view says why.
         assert!(left.iter().chain(right).all(|line| !line.changed));
         match &view.body {
             Body::Text {
-                marks_unavailable, ..
-            } => assert_eq!(*marks_unavailable, Some(MARKS_UNAVAILABLE)),
+                marks_unavailable,
+                current_more,
+                other_more,
+                ..
+            } => {
+                assert_eq!(*marks_unavailable, Some(MARKS_UNAVAILABLE));
+                let note = Some("Showing the first 2,000 of 40,000 lines.".to_owned());
+                assert_eq!((current_more, other_more), (&note, &note));
+            }
             body => panic!("not a comparison: {body:?}"),
         }
+    }
+
+    fn numbered(count: usize) -> String {
+        (1..=count)
+            .map(|n| {
+                format!(
+                    "row {n}
+"
+                )
+            })
+            .collect()
+    }
+
+    fn mores(view: &ConflictDetailView) -> (Option<String>, Option<String>) {
+        match &view.body {
+            Body::Text {
+                current_more,
+                other_more,
+                ..
+            } => (current_more.clone(), other_more.clone()),
+            body => panic!("not a comparison: {body:?}"),
+        }
+    }
+
+    #[test]
+    fn exactly_two_thousand_lines_are_shown_whole_without_a_note() {
+        let current = numbered(LINE_CAP);
+        let other = current.replace(
+            "row 7
+",
+            "row seven
+",
+        );
+        let detail = detail_of(
+            conflict("c", "rows.txt", false),
+            Some(current.as_bytes()),
+            Some(other.as_bytes()),
+            Some(current.as_bytes()),
+        );
+        let view = detail_view(&detail, THIS, (1, 1));
+        let (left, right) = text_lines(&view);
+        assert_eq!((left.len(), right.len()), (2_000, 2_000));
+        assert_eq!(left.last().unwrap().text, "row 2000");
+        assert_eq!(mores(&view), (None, None));
+        let base = view.base.as_ref().unwrap();
+        assert_eq!((base.lines.len(), &base.more), (2_000, &None));
+        assert!(left[6].changed && right[6].changed);
+    }
+
+    #[test]
+    fn two_thousand_and_one_lines_show_the_first_two_thousand_and_say_so() {
+        let current = numbered(LINE_CAP + 1);
+        // Only the other version is long; the current one fits.
+        let short = numbered(10);
+        let detail = detail_of(
+            conflict("c", "rows.txt", false),
+            Some(short.as_bytes()),
+            Some(current.as_bytes()),
+            Some(short.as_bytes()),
+        );
+        let view = detail_view(&detail, THIS, (1, 1));
+        let (left, right) = text_lines(&view);
+        assert_eq!((left.len(), right.len()), (10, 2_000));
+        assert_eq!(right.last().unwrap().number, 2_000);
+        assert_eq!(
+            mores(&view),
+            (
+                None,
+                Some("Showing the first 2,000 of 2,001 lines.".to_owned())
+            )
+        );
+        // The marks come from the whole files: the lines past the cut are
+        // added, and the ones shown past the current version's end are too.
+        assert!(right[10..].iter().all(|line| line.changed));
+        assert!(right[..10].iter().all(|line| !line.changed));
+    }
+
+    #[test]
+    fn a_long_common_base_is_cut_like_the_columns() {
+        let base = numbered(12_345);
+        let detail = detail_of(
+            conflict("c", "rows.txt", false),
+            Some(
+                b"current
+",
+            ),
+            Some(
+                b"other
+",
+            ),
+            Some(base.as_bytes()),
+        );
+        let view = detail_view(&detail, THIS, (1, 1));
+        let base = view.base.as_ref().unwrap();
+        assert_eq!(base.lines.len(), LINE_CAP);
+        assert_eq!(
+            base.more.as_deref(),
+            Some("Showing the first 2,000 of 12,345 lines.")
+        );
+        assert_eq!(mores(&view), (None, None));
+    }
+
+    #[test]
+    fn line_counts_are_grouped_by_thousands() {
+        assert_eq!(grouped(7), "7");
+        assert_eq!(grouped(999), "999");
+        assert_eq!(grouped(2_000), "2,000");
+        assert_eq!(grouped(40_000), "40,000");
+        assert_eq!(grouped(1_234_567), "1,234,567");
     }
 }

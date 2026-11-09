@@ -99,22 +99,7 @@ impl Workspace {
     /// One unresolved conflict's versions, history and whether the file was
     /// saved again since. Errors for an unknown or already resolved conflict.
     pub fn conflict_detail(&self, id: &str) -> Result<ConflictDetail> {
-        let conflict = self.state.conflicts.get(id).context("Conflict not found")?;
-        ensure!(
-            !self.state.manifest.resolutions.contains_key(id),
-            "Conflict is already resolved"
-        );
-        let edited_after = (self.state.observed.get(&conflict.path) != conflict.accepted.as_ref())
-            .then(|| {
-                self.state
-                    .manifest
-                    .sessions
-                    .values()
-                    .filter(|session| session.device == self.config.device)
-                    .filter_map(|session| session.changes.get(&conflict.path))
-                    .map(|change| change.last_edit)
-                    .fold(conflict.created_at, u64::max)
-            });
+        let conflict = self.unresolved_conflict(id)?;
         Ok(ConflictDetail {
             status: self.conflict_status(conflict),
             current_history: self.history_of(&conflict.path, &conflict.accepted),
@@ -122,7 +107,36 @@ impl Workspace {
             base: conflict.base.clone(),
             current: conflict.accepted.clone(),
             other: conflict.incoming.clone(),
-            edited_after,
+            edited_after: self.edited_after(conflict),
+        })
+    }
+
+    /// Only [`ConflictDetail::edited_after`] of one unresolved conflict: no
+    /// Git and no copies of the versions, so a window can follow a later save
+    /// cheaply while the conflict is open.
+    pub fn conflict_edited_after(&self, id: &str) -> Result<Option<u64>> {
+        Ok(self.edited_after(self.unresolved_conflict(id)?))
+    }
+
+    fn unresolved_conflict(&self, id: &str) -> Result<&Conflict> {
+        let conflict = self.state.conflicts.get(id).context("Conflict not found")?;
+        ensure!(
+            !self.state.manifest.resolutions.contains_key(id),
+            "Conflict is already resolved"
+        );
+        Ok(conflict)
+    }
+
+    fn edited_after(&self, conflict: &Conflict) -> Option<u64> {
+        (self.state.observed.get(&conflict.path) != conflict.accepted.as_ref()).then(|| {
+            self.state
+                .manifest
+                .sessions
+                .values()
+                .filter(|session| session.device == self.config.device)
+                .filter_map(|session| session.changes.get(&conflict.path))
+                .map(|change| change.last_edit)
+                .fold(conflict.created_at, u64::max)
         })
     }
 
